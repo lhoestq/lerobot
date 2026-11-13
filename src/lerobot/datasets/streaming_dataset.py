@@ -64,9 +64,6 @@ from .video_utils import (
     normalize_rgb_frames,
 )
 
-# Seed used when the caller gives none (for example when `lerobot-train` runs with `--seed=null`).
-DEFAULT_STREAMING_SEED = 42
-
 
 @dataclass(frozen=True)
 class _EpisodeData:
@@ -173,7 +170,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
         streaming: bool | None = None,
         buffer_size: int = 1000,
         max_num_shards: int = 16,
-        seed: int = DEFAULT_STREAMING_SEED,
+        seed: int = 42,
         rng: np.random.Generator | None = None,
         shuffle: bool = True,
         return_uint8: bool = False,
@@ -223,8 +220,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset[dict[str, Any]]):
                 Maximum internal episode-fetch concurrency, not DataLoader process count.
                 ``lerobot-train`` sets it from ``--num_workers``.
             seed (`int`, *optional*, defaults to `42`):
-                Seed for deterministic episode admission and anchor sampling. ``lerobot-train``
-                passes ``--seed``, or ``DEFAULT_STREAMING_SEED`` when ``--seed`` is null.
+                Seed for deterministic episode admission and anchor sampling.
             rng (`np.random.Generator | None`, *optional*):
                 Deprecated and ignored; set seed instead.
             shuffle (`bool`, *optional*, defaults to `True`):
