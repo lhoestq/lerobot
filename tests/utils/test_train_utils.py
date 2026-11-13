@@ -243,9 +243,6 @@ def test_streaming_dataloader_uses_num_workers_capped_by_rank_episodes(num_worke
     class Dataset(torch.utils.data.IterableDataset):
         meta = SimpleNamespace(has_language_columns=False)
 
-        def set_data_parallel_shard(self, rank, world_size):
-            pass
-
         def num_episodes_for_rank(self, rank, world_size):
             return 8
 
