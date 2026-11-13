@@ -26,7 +26,7 @@ import fsspec
 from huggingface_hub import HfApi, HfFileSystem, constants
 from huggingface_hub.utils import hf_raise_for_status, httpx
 
-from .location import LocationKind, StorageLocation
+from lerobot.streaming.location import LocationKind, StorageLocation
 
 
 def _retry_delay_s(attempt: int) -> float:
