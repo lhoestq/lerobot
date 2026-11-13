@@ -402,7 +402,6 @@ all = [
 ]
 
 [project.scripts]
-lerobot-build-mp4-sidecar="lerobot.scripts.lerobot_build_mp4_sidecar:main"
 lerobot-calibrate="lerobot.scripts.lerobot_calibrate:main"
 lerobot-find-cameras="lerobot.scripts.lerobot_find_cameras:main"
 lerobot-find-port="lerobot.scripts.lerobot_find_port:main"
@@ -570,6 +569,7 @@ default.extend-ignore-identifiers-re = [
     "nd",  # einsum output axes "...nd" in the vendored FLUX 3 Action transformer
     "EmbedND",
 ]
+default.extend-words = { nd = "nd" }
 
 # Docstring coverage gate. `fail-under` is a RATCHET, not a target: it is set just below the currently
 # measured coverage so it passes today, and is raised in the same PR that documents a module. Never set it
