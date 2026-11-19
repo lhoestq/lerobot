@@ -13,16 +13,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import asyncio
 import random
+from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
+from functools import partial
+from itertools import batched, islice
 from pathlib import Path
 from typing import Any, Literal
 
 import datasets
 import fsspec
-import numpy as np
 import torch
 from datasets import load_dataset
 
@@ -39,9 +41,17 @@ from .utils import (
     is_float_in_list,
 )
 from .video_utils import (
+    _decode_torchcodec_frames,
+    _match_torchcodec_frames,
+    _StreamingVideoDecoderPool,
     decode_video_frames,
     decode_video_frames_torchcodec,
 )
+
+_DECODE_WORKERS = 32
+# Retain several camera decoders per concurrent sample while bounding open sources.
+_DECODER_POOL_CAPACITY = 3 * _DECODE_WORKERS
+_RGB_DECODE_GROUP_SIZE = 8
 
 
 class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
@@ -54,6 +64,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     The key innovation is using a Backtrackable iterator that maintains a bounded buffer of recent
     items, allowing us to access previous frames for delta timestamps without loading the entire
     dataset into memory.
+
+    For RGB-only reads of current frames without transforms, the reader groups requests for the
+    same video within eight consecutive samples. This group size is independent of the DataLoader
+    batch size and preserves sample order.
 
     Example:
         Basic usage:
@@ -225,23 +239,63 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         return self._depth_output_unit
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
-
         ds = self.hf_dataset
         ds = ds.batch(by_column="episode_index")
         ds = ds.shuffle(seed=42, buffer_size=self.buffer_size)
 
         ds = ds.map(self._sample_pool_with_delta, batched=True, batch_size=self.buffer_size)
 
-        decode_workers = 32
-        decode_thread_pool = ThreadPoolExecutor(decode_workers)
-        decode_semaphore = asyncio.Semaphore(decode_workers)
+        with closing(_StreamingVideoDecoderPool(_DECODER_POOL_CAPACITY)) as decoder_pool:
+            executor = ThreadPoolExecutor(_DECODE_WORKERS)
+            try:
+                if (
+                    self.delta_indices is None
+                    and self.image_transforms is None
+                    and not self.meta.depth_keys
+                    and self.meta.video_keys
+                    and self._uses_default_video_query()
+                ):
+                    yield from self._decode_rgb_groups(iter(ds), executor, decoder_pool)
+                else:
+                    yield from self._decode_samples(iter(ds), executor, decoder_pool)
+            finally:
+                # Wait for leased decoders to return before closing their sources.
+                executor.shutdown(cancel_futures=True)
 
-        async def decode_frames(item):
-            async with decode_semaphore:
-                return await asyncio.get_running_loop().run_in_executor(decode_thread_pool, self.query_frames, item)
+    def _uses_default_video_query(self) -> bool:
+        return (
+            getattr(self.query_frames, "__func__", None) is StreamingLeRobotDataset.query_frames
+            and getattr(self._query_videos, "__func__", None) is StreamingLeRobotDataset._query_videos
+        )
 
-        ds = ds.map(decode_frames)
-        yield from ds
+    def _decode_samples(
+        self,
+        samples: Iterator[dict[str, Any]],
+        executor: ThreadPoolExecutor,
+        decoder_pool: _StreamingVideoDecoderPool,
+    ) -> Iterator[dict[str, Any]]:
+        def read_rgb_video(video_path: str, timestamps: list[float]) -> torch.Tensor:
+            with decoder_pool.lease(video_path) as (decoder, video_file):
+                return _decode_torchcodec_frames(
+                    decoder, timestamps, self.tolerance_s, video_file, return_uint8=self._return_uint8
+                )
+
+        def query_frames_direct(item: dict[str, Any]) -> dict[str, Any]:
+            # Match the map merge for subclasses that return updated columns only.
+            return {**item, **self.query_frames(item.copy())}
+
+        query_frames: Callable[[dict[str, Any]], dict[str, Any]] = query_frames_direct
+        if self._uses_default_video_query():
+            query_videos = partial(self._query_videos, read_rgb_video=read_rgb_video)
+            query_frames = partial(self._query_frames, query_videos=query_videos)
+
+        pending: deque[Future[dict[str, Any]]] = deque()
+        for item in samples:
+            pending.append(executor.submit(query_frames, item))
+            if len(pending) == _DECODE_WORKERS:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
 
     def _sample_pool_with_delta(self, episodes_batch):
         episode_batches = [
@@ -254,7 +308,11 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 query_results, paddings = self._get_delta_frames(episode_batch)
                 episode_batch.update(query_results)
                 episode_batch.update(paddings)
-        samples = [(ep, frame) for ep in range(len(episode_batches)) for frame in range(len(episode_batches[ep]["episode_index"]))]
+        samples = [
+            (ep, frame)
+            for ep in range(len(episode_batches))
+            for frame in range(len(episode_batches[ep]["episode_index"]))
+        ]
         random.Random("|".join(str(ep[0]) for ep in episodes_batch["episode_index"])).shuffle(samples)
         out = {col: [episode_batches[ep][col][frame] for ep, frame in samples] for col in episodes_batch}
         return out
@@ -271,6 +329,104 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             }
         else:
             return dict.fromkeys(self.meta.video_keys, [start_ts])
+
+    def _decode_rgb_groups(
+        self,
+        samples: Iterator[dict[str, Any]],
+        executor: ThreadPoolExecutor,
+        decoder_pool: _StreamingVideoDecoderPool,
+    ) -> Iterator[dict[str, Any]]:
+        groups = batched(samples, _RGB_DECODE_GROUP_SIZE)
+        # Use the same prefetch limit in samples as the per-sample decoder.
+        max_pending_groups = _DECODE_WORKERS // _RGB_DECODE_GROUP_SIZE
+        pending = deque(
+            self._submit_rgb_group(group, executor, decoder_pool)
+            for group in islice(groups, max_pending_groups)
+        )
+        while pending:
+            yield from pending.popleft()
+            if next_group := next(groups, None):
+                pending.append(self._submit_rgb_group(next_group, executor, decoder_pool))
+
+    def _submit_rgb_group(
+        self,
+        group: tuple[dict[str, Any], ...],
+        executor: ThreadPoolExecutor,
+        decoder_pool: _StreamingVideoDecoderPool,
+    ) -> Iterator[dict[str, Any]]:
+        requests_by_path: dict[str, list[tuple[int, str, float]]] = defaultdict(list)
+        try:
+            for row, sample in enumerate(group):
+                episode = int(sample["episode_index"])
+                timestamp = int(sample["frame_index"]) / self.fps
+                for key, (query_timestamp,) in self._get_video_query_timestamps(episode, timestamp).items():
+                    path = self._video_path(episode, key)
+                    requests_by_path[path].append((row, key, query_timestamp))
+        except Exception:
+            # Report metadata errors in sample order with the native reader.
+            return self._decode_samples(iter(group), executor, decoder_pool)
+
+        frame_reads: list[dict[str, tuple[Future[list[torch.Tensor]], int, bool]]] = [{} for _ in group]
+        for path, requests in requests_by_path.items():
+            timestamps = [timestamp for _, _, timestamp in requests]
+            future = executor.submit(self._read_rgb_group, decoder_pool, path, timestamps)
+            is_grouped = len(requests) > 1
+            for offset, (row, key, _) in enumerate(requests):
+                frame_reads[row][key] = (future, offset, is_grouped)
+
+        def ordered_results() -> Iterator[dict[str, Any]]:
+            video_keys = self.meta.video_keys
+            for row, (sample, reads) in enumerate(zip(group, frame_reads, strict=True)):
+                task_idx = int(sample["task_index"])
+                result = sample.copy()
+                for key in video_keys:
+                    future, offset, is_grouped = reads[key]
+                    try:
+                        result[key] = future.result()[offset]
+                    except Exception:
+                        if not is_grouped:
+                            raise
+                        # A grouped read can fail on a later frame. Recover the valid prefix
+                        # and report the failing sample via the existing per-sample path.
+                        yield from self._decode_samples(iter(group[row:]), executor, decoder_pool)
+                        return
+                result["task"] = self.meta.tasks.iloc[task_idx].name
+                yield result
+
+        return ordered_results()
+
+    def _read_rgb_group(
+        self, decoder_pool: _StreamingVideoDecoderPool, path: str, timestamps: list[float]
+    ) -> list[torch.Tensor]:
+        with decoder_pool.lease(path) as (decoder, video_file):
+            if len(timestamps) == 1:
+                return [
+                    _decode_torchcodec_frames(
+                        decoder, timestamps, self.tolerance_s, video_file, return_uint8=self._return_uint8
+                    ).squeeze(0)
+                ]
+
+            fps = decoder.metadata.average_fps
+            frame_indices = [round(timestamp * fps) for timestamp in timestamps]
+            unique_indices = sorted(set(frame_indices))
+            batch = decoder.get_frames_at(indices=unique_indices)
+            offsets = {index: offset for offset, index in enumerate(unique_indices)}
+
+            # A singleton request must pass tolerance against its own frame.
+            # Matching against the whole batch could accept a neighboring frame.
+            frames = []
+            for timestamp, index in zip(timestamps, frame_indices, strict=True):
+                offset = offsets[index]
+                frame = _match_torchcodec_frames(
+                    [timestamp],
+                    batch.data[offset : offset + 1],
+                    batch.pts_seconds[offset : offset + 1],
+                    self.tolerance_s,
+                    video_file,
+                    return_uint8=self._return_uint8,
+                )
+                frames.append(frame.squeeze(0))
+            return frames
 
     def _make_padding_camera_frame(self, camera_key: str):
         """Variable-shape padding frame for given camera keys, given in (H, W, C)"""
@@ -303,18 +459,17 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         return padding_mask
 
-    def query_frames(self, item) -> dict:
+    def query_frames(self, item: dict[str, Any]) -> dict[str, Any]:
+        return self._query_frames(item, self._query_videos)
+
+    def _query_frames(
+        self,
+        item: dict[str, Any],
+        query_videos: Callable[[dict[str, list[float]], int], dict[str, torch.Tensor]],
+    ) -> dict[str, Any]:
         ep_idx = int(item["episode_index"])
         task_idx = int(item["task_index"])
         current_ts = int(item["frame_index"]) / self.fps
-
-        episode_boundaries_ts = {
-            key: (
-                self.meta.episodes[ep_idx][f"videos/{key}/from_timestamp"],
-                self.meta.episodes[ep_idx][f"videos/{key}/to_timestamp"],
-            )
-            for key in self.meta.video_keys
-        }
 
         updates = []
 
@@ -323,10 +478,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
 
             # Some timestamps might not result available considering the episode's boundaries
-            query_timestamps = self._get_query_timestamps(
-                current_ts, self.delta_indices, episode_boundaries_ts
-            )
-            video_frames = self._query_videos(query_timestamps, ep_idx)
+            query_timestamps = self._get_video_query_timestamps(ep_idx, current_ts)
+            video_frames = query_videos(query_timestamps, ep_idx)
 
             if self.image_transforms is not None:
                 image_keys = self.meta.camera_keys
@@ -375,22 +528,33 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             ).tolist()
         return query_timestamps
 
-    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict:
-        """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
-        in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
-        Segmentation Fault. This probably happens because a memory reference to the video loader is created in
-        the main process and a subprocess fails to access it.
-        """
+    def _get_video_query_timestamps(self, episode: int, timestamp: float) -> dict[str, list[float]]:
+        episode_metadata = self.meta.episodes[episode]
+        episode_boundaries = {
+            key: (
+                episode_metadata[f"videos/{key}/from_timestamp"],
+                episode_metadata[f"videos/{key}/to_timestamp"],
+            )
+            for key in self.meta.video_keys
+        }
+        return self._get_query_timestamps(timestamp, self.delta_indices, episode_boundaries)
 
+    def _video_path(self, ep_idx: int, video_key: str) -> str:
+        root = self.root if self.streaming_from_local else self.meta.url_root
+        video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
+        # sharedblockcache shares cached blocks safely between decode threads.
+        return video_path if self.streaming_from_local else f"sharedblockcache::{video_path}"
+
+    def _query_videos(
+        self,
+        query_timestamps: dict[str, list[float]],
+        ep_idx: int,
+        *,
+        read_rgb_video: Callable[[str, list[float]], torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
         item = {}
         for video_key, query_ts in query_timestamps.items():
-            root = self.meta.url_root if not self.streaming_from_local else self.root
-            video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
-            if not self.streaming_from_local:
-                # Caching video file blocks speeds-up streaming.
-                # Contrary to fsspec's "blockcache", "sharedblockcache" is thread-safe
-                # and shares the cache between threads.
-                video_path = "sharedblockcache::" + video_path
+            video_path = self._video_path(ep_idx, video_key)
             if video_key in self.meta.depth_keys:
                 # Depth maps are 12-bit quantized and only decodable via pyav; dequantize back
                 # to physical units to match the non-streaming reader.
@@ -412,6 +576,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                     use_log=depth_encoder.use_log,
                     output_unit=self._depth_output_unit,
                 )
+            elif read_rgb_video is not None:
+                frames = read_rgb_video(video_path, query_ts)
             else:
                 with fsspec.open(video_path) as video_file:
                     frames = decode_video_frames_torchcodec(
@@ -425,9 +591,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         return item
 
-    def _get_delta_frames(
-        self, episode_batch
-    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+    def _get_delta_frames(self, episode_batch) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """Get frames with delta offsets for every step.
 
         Args:
@@ -459,7 +623,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 delta_results = {}
 
                 # Separate and sort deltas by difficulty (easier operations first)
-                negative_deltas = sorted([d for d in delta_indices if d < 0], reverse=True)  # [-1, -2, -3, ...]
+                negative_deltas = sorted(
+                    [d for d in delta_indices if d < 0], reverse=True
+                )  # [-1, -2, -3, ...]
                 positive_deltas = sorted([d for d in delta_indices if d > 0])  # [1, 2, 3, ...]
                 zero_deltas = [d for d in delta_indices if d == 0]
 

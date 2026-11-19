@@ -22,13 +22,14 @@ import shutil
 import tempfile
 import threading
 import warnings
-from collections.abc import Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, BinaryIO, ClassVar
+from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
 import av
+import fsspec
 import numpy as np
 import pyarrow as pa
 import torch
@@ -46,6 +47,9 @@ from lerobot.utils.import_utils import get_safe_default_video_backend
 
 from .depth_utils import quantize_depth
 from .pyav_utils import get_pix_fmt_channels
+
+if TYPE_CHECKING:
+    from torchcodec.decoders import VideoDecoder
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +259,86 @@ class FrameTimestampError(ValueError):
     """Helper error to indicate the retrieved timestamps exceed the queried ones"""
 
 
+@dataclass
+class _StreamingVideoDecoderEntry:
+    path: str
+    resources: contextlib.ExitStack
+    video_file: BinaryIO
+    decoder: "VideoDecoder"
+
+
+class _StreamingVideoDecoderPool:
+    """Keep a bounded set of open decoders for one streaming iterator.
+
+    Each lease owns its decoder and source exclusively. Concurrent requests for
+    one path can use separate decoders, and eviction only closes idle entries.
+    """
+
+    def __init__(self, capacity: int):
+        if capacity < 1:
+            raise ValueError("The video decoder pool requires a positive capacity")
+        self._capacity = capacity
+        self._condition = threading.Condition()
+        self._size = 0
+        self._idle: list[_StreamingVideoDecoderEntry] = []
+
+    def _acquire(self, path: str) -> _StreamingVideoDecoderEntry:
+        from torchcodec.decoders import VideoDecoder
+
+        evicted_resources = None
+        with self._condition:
+            self._condition.wait_for(lambda: self._idle or self._size < self._capacity)
+            for index in range(len(self._idle) - 1, -1, -1):
+                if self._idle[index].path == path:
+                    return self._idle.pop(index)
+
+            if self._size == self._capacity:
+                evicted_resources = self._idle.pop(0).resources
+            else:
+                self._size += 1
+
+        resources = contextlib.ExitStack()
+        try:
+            if evicted_resources is not None:
+                evicted_resources.close()
+            video_file = resources.enter_context(fsspec.open(path))
+            decoder = VideoDecoder(video_file, seek_mode="approximate")
+        except BaseException:
+            self._discard(resources)
+            raise
+        return _StreamingVideoDecoderEntry(path, resources, video_file, decoder)
+
+    def _discard(self, resources: contextlib.ExitStack) -> None:
+        try:
+            resources.close()
+        finally:
+            with self._condition:
+                self._size -= 1
+                self._condition.notify()
+
+    @contextlib.contextmanager
+    def lease(self, path: str) -> Iterator[tuple["VideoDecoder", BinaryIO]]:
+        entry = self._acquire(path)
+        try:
+            yield entry.decoder, entry.video_file
+        except BaseException:
+            self._discard(entry.resources)
+            raise
+        else:
+            with self._condition:
+                self._idle.append(entry)
+                self._condition.notify()
+
+    def close(self) -> None:
+        """Close all sources after the decode executor has stopped."""
+        with self._condition, contextlib.ExitStack() as resources:
+            if len(self._idle) != self._size:
+                raise RuntimeError("Cannot close the video decoder pool with active leases")
+            for entry in self._idle:
+                resources.callback(entry.resources.close)
+            self._idle.clear()
+            self._size = 0
+
 
 def decode_video_frames_torchcodec(
     video_file: BinaryIO,
@@ -282,19 +366,53 @@ def decode_video_frames_torchcodec(
     from torchcodec.decoders import VideoDecoder
 
     decoder = VideoDecoder(video_file, seek_mode="approximate")
+    return _decode_torchcodec_frames(
+        decoder,
+        timestamps,
+        tolerance_s,
+        video_file,
+        log_loaded_timestamps=log_loaded_timestamps,
+        return_uint8=return_uint8,
+    )
 
+
+def _decode_torchcodec_frames(
+    decoder: "VideoDecoder",
+    timestamps: list[float],
+    tolerance_s: float,
+    video_file: BinaryIO,
+    *,
+    log_loaded_timestamps: bool = False,
+    return_uint8: bool = False,
+) -> torch.Tensor:
+    average_fps = decoder.metadata.average_fps
+    frame_indices = [round(ts * average_fps) for ts in timestamps]
+    frames_batch = decoder.get_frames_at(indices=frame_indices)
+    return _match_torchcodec_frames(
+        timestamps,
+        frames_batch.data,
+        frames_batch.pts_seconds,
+        tolerance_s,
+        video_file,
+        log_loaded_timestamps=log_loaded_timestamps,
+        return_uint8=return_uint8,
+    )
+
+
+def _match_torchcodec_frames(
+    timestamps: list[float],
+    frames: Iterable[torch.Tensor],
+    pts_seconds: Iterable[torch.Tensor],
+    tolerance_s: float,
+    video_file: BinaryIO,
+    *,
+    log_loaded_timestamps: bool = False,
+    return_uint8: bool = False,
+) -> torch.Tensor:
     loaded_ts = []
     loaded_frames = []
 
-    # get metadata for frame information
-    metadata = decoder.metadata
-    average_fps = metadata.average_fps
-    # convert timestamps to frame indices
-    frame_indices = [round(ts * average_fps) for ts in timestamps]
-    # retrieve frames based on indices
-    frames_batch = decoder.get_frames_at(indices=frame_indices)
-
-    for frame, pts in zip(frames_batch.data, frames_batch.pts_seconds, strict=True):
+    for frame, pts in zip(frames, pts_seconds, strict=True):
         loaded_frames.append(frame)
         loaded_ts.append(pts.item())
         if log_loaded_timestamps:
