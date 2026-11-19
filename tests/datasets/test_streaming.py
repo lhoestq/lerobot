@@ -258,6 +258,7 @@ def test_frames_order_with_shards(tmp_path, lerobot_dataset_factory, shuffle):
 
 def test_iter_raises_on_frame_error(tmp_path, lerobot_dataset_factory, monkeypatch):
     """Video decode failures must propagate instead of being silently ignored."""
+    decoders = pytest.importorskip("torchcodec.decoders")
     ds_num_frames = 20
     ds_num_episodes = 2
     buffer_size = 10
@@ -272,12 +273,12 @@ def test_iter_raises_on_frame_error(tmp_path, lerobot_dataset_factory, monkeypat
         total_frames=ds_num_frames,
     )
 
-    streaming_ds = StreamingLeRobotDataset(repo_id=repo_id, root=local_path, buffer_size=buffer_size)
+    streaming_ds = StreamingLeRobotDataset(repo_id=str(local_path), root=local_path, buffer_size=buffer_size)
 
     def broken_video_decode(*args, **kwargs):
         raise RuntimeError("Could not load libtorchcodec")
 
-    monkeypatch.setattr(streaming_dataset_module, "decode_video_frames_torchcodec", broken_video_decode)
+    monkeypatch.setattr(decoders.VideoDecoder, "get_frames_at", broken_video_decode)
 
     with pytest.raises(RuntimeError, match="libtorchcodec"):
         next(iter(streaming_ds))
@@ -285,11 +286,12 @@ def test_iter_raises_on_frame_error(tmp_path, lerobot_dataset_factory, monkeypat
 
 def test_iter_raises_on_nested_generator_error(tmp_path, lerobot_dataset_factory, monkeypatch):
     """PEP 479 errors below frame construction must not be mistaken for shard exhaustion."""
+    decoders = pytest.importorskip("torchcodec.decoders")
     local_path = tmp_path / "test"
     repo_id = DUMMY_REPO_ID
 
     lerobot_dataset_factory(root=local_path, repo_id=repo_id, total_episodes=2, total_frames=20)
-    streaming_ds = StreamingLeRobotDataset(repo_id=repo_id, root=local_path, buffer_size=10)
+    streaming_ds = StreamingLeRobotDataset(repo_id=str(local_path), root=local_path, buffer_size=10)
 
     def broken_frame_generator():
         raise StopIteration("decoder internal failure")
@@ -298,7 +300,7 @@ def test_iter_raises_on_nested_generator_error(tmp_path, lerobot_dataset_factory
     def broken_video_decode(*args, **kwargs):
         return next(broken_frame_generator())
 
-    monkeypatch.setattr(streaming_dataset_module, "decode_video_frames_torchcodec", broken_video_decode)
+    monkeypatch.setattr(decoders.VideoDecoder, "get_frames_at", broken_video_decode)
 
     with pytest.raises(RuntimeError, match="generator raised StopIteration"):
         next(iter(streaming_ds))

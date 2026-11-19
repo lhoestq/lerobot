@@ -13,16 +13,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import asyncio
 import random
+from collections import deque
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
 import datasets
 import fsspec
-import numpy as np
 import torch
 from datasets import load_dataset
 
@@ -39,9 +40,15 @@ from .utils import (
     is_float_in_list,
 )
 from .video_utils import (
+    _decode_torchcodec_frames,
+    _StreamingVideoDecoderPool,
     decode_video_frames,
     decode_video_frames_torchcodec,
 )
+
+_DECODE_WORKERS = 32
+# Retain several camera decoders per concurrent sample while bounding open sources.
+_DECODER_POOL_CAPACITY = 3 * _DECODE_WORKERS
 
 
 class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
@@ -232,16 +239,45 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         ds = ds.map(self._sample_pool_with_delta, batched=True, batch_size=self.buffer_size)
 
-        decode_workers = 32
-        decode_thread_pool = ThreadPoolExecutor(decode_workers)
-        decode_semaphore = asyncio.Semaphore(decode_workers)
+        with closing(_StreamingVideoDecoderPool(_DECODER_POOL_CAPACITY)) as decoder_pool:
+            executor = ThreadPoolExecutor(_DECODE_WORKERS)
+            try:
+                yield from self._decode_samples(iter(ds), executor, decoder_pool)
+            finally:
+                # Wait for leased decoders to return before closing their sources.
+                executor.shutdown(cancel_futures=True)
 
-        async def decode_frames(item):
-            async with decode_semaphore:
-                return await asyncio.get_running_loop().run_in_executor(decode_thread_pool, self.query_frames, item)
+    def _decode_samples(
+        self,
+        samples: Iterator[dict[str, Any]],
+        executor: ThreadPoolExecutor,
+        decoder_pool: _StreamingVideoDecoderPool,
+    ) -> Iterator[dict[str, Any]]:
+        def read_rgb_video(video_path: str, timestamps: list[float]) -> torch.Tensor:
+            with decoder_pool.lease(video_path) as (decoder, video_file):
+                return _decode_torchcodec_frames(
+                    decoder, timestamps, self.tolerance_s, video_file, return_uint8=self._return_uint8
+                )
 
-        ds = ds.map(decode_frames)
-        yield from ds
+        def query_frames_direct(item: dict[str, Any]) -> dict[str, Any]:
+            # Match the map merge for subclasses that return updated columns only.
+            return {**item, **self.query_frames(item.copy())}
+
+        query_frames: Callable[[dict[str, Any]], dict[str, Any]] = query_frames_direct
+        if (
+            getattr(self.query_frames, "__func__", None) is StreamingLeRobotDataset.query_frames
+            and getattr(self._query_videos, "__func__", None) is StreamingLeRobotDataset._query_videos
+        ):
+            query_videos = partial(self._query_videos, read_rgb_video=read_rgb_video)
+            query_frames = partial(self._query_frames, query_videos=query_videos)
+
+        pending: deque[Future[dict[str, Any]]] = deque()
+        for item in samples:
+            pending.append(executor.submit(query_frames, item))
+            if len(pending) == _DECODE_WORKERS:
+                yield pending.popleft().result()
+        while pending:
+            yield pending.popleft().result()
 
     def _sample_pool_with_delta(self, episodes_batch):
         episode_batches = [
@@ -303,7 +339,14 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         return padding_mask
 
-    def query_frames(self, item) -> dict:
+    def query_frames(self, item: dict[str, Any]) -> dict[str, Any]:
+        return self._query_frames(item, self._query_videos)
+
+    def _query_frames(
+        self,
+        item: dict[str, Any],
+        query_videos: Callable[[dict[str, list[float]], int], dict[str, torch.Tensor]],
+    ) -> dict[str, Any]:
         ep_idx = int(item["episode_index"])
         task_idx = int(item["task_index"])
         current_ts = int(item["frame_index"]) / self.fps
@@ -326,7 +369,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             query_timestamps = self._get_query_timestamps(
                 current_ts, self.delta_indices, episode_boundaries_ts
             )
-            video_frames = self._query_videos(query_timestamps, ep_idx)
+            video_frames = query_videos(query_timestamps, ep_idx)
 
             if self.image_transforms is not None:
                 image_keys = self.meta.camera_keys
@@ -375,22 +418,22 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             ).tolist()
         return query_timestamps
 
-    def _query_videos(self, query_timestamps: dict[str, list[float]], ep_idx: int) -> dict:
-        """Note: When using data workers (e.g. DataLoader with num_workers>0), do not call this function
-        in the main process (e.g. by using a second Dataloader with num_workers=0). It will result in a
-        Segmentation Fault. This probably happens because a memory reference to the video loader is created in
-        the main process and a subprocess fails to access it.
-        """
+    def _video_path(self, ep_idx: int, video_key: str) -> str:
+        root = self.root if self.streaming_from_local else self.meta.url_root
+        video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
+        # sharedblockcache shares cached blocks safely between decode threads.
+        return video_path if self.streaming_from_local else f"sharedblockcache::{video_path}"
 
+    def _query_videos(
+        self,
+        query_timestamps: dict[str, list[float]],
+        ep_idx: int,
+        *,
+        read_rgb_video: Callable[[str, list[float]], torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
         item = {}
         for video_key, query_ts in query_timestamps.items():
-            root = self.meta.url_root if not self.streaming_from_local else self.root
-            video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
-            if not self.streaming_from_local:
-                # Caching video file blocks speeds-up streaming.
-                # Contrary to fsspec's "blockcache", "sharedblockcache" is thread-safe
-                # and shares the cache between threads.
-                video_path = "sharedblockcache::" + video_path
+            video_path = self._video_path(ep_idx, video_key)
             if video_key in self.meta.depth_keys:
                 # Depth maps are 12-bit quantized and only decodable via pyav; dequantize back
                 # to physical units to match the non-streaming reader.
@@ -412,6 +455,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                     use_log=depth_encoder.use_log,
                     output_unit=self._depth_output_unit,
                 )
+            elif read_rgb_video is not None:
+                frames = read_rgb_video(video_path, query_ts)
             else:
                 with fsspec.open(video_path) as video_file:
                     frames = decode_video_frames_torchcodec(
