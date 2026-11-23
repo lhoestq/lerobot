@@ -16,7 +16,6 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import numpy as np
 import pytest
 import torch
 
@@ -25,57 +24,10 @@ pytest.importorskip("datasets", reason="datasets is required (install lerobot[da
 import lerobot.datasets.streaming_dataset as streaming_dataset_module
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
-from lerobot.datasets.utils import safe_shard
 from lerobot.utils.constants import ACTION
 from tests.fixtures.constants import DUMMY_REPO_ID
 
 pytestmark = pytest.mark.dataset
-
-
-def get_frames_expected_order(streaming_ds: StreamingLeRobotDataset) -> list[int]:
-    """Replicates the shuffling logic of StreamingLeRobotDataset to get the expected order of indices."""
-    rng = np.random.default_rng(streaming_ds.seed)
-    buffer_size = streaming_ds.buffer_size
-    num_shards = streaming_ds.num_shards
-
-    shards_indices = []
-    for shard_idx in range(num_shards):
-        shard = streaming_ds.hf_dataset.shard(num_shards, index=shard_idx)
-        shard_indices = [item["index"] for item in shard]
-        shards_indices.append(shard_indices)
-
-    shard_iterators = {i: iter(s) for i, s in enumerate(shards_indices)}
-
-    buffer_indices_generator = streaming_ds._iter_random_indices(rng, buffer_size)
-
-    frames_buffer = []
-    expected_indices = []
-
-    while shard_iterators:  # While there are still available shards
-        available_shard_keys = list(shard_iterators.keys())
-        if not available_shard_keys:
-            break
-
-        # Call _infinite_generator_over_elements with current available shards (key difference!)
-        shard_key = next(streaming_ds._infinite_generator_over_elements(rng, available_shard_keys))
-
-        try:
-            frame_index = next(shard_iterators[shard_key])
-
-            if len(frames_buffer) == buffer_size:
-                i = next(buffer_indices_generator)
-                expected_indices.append(frames_buffer[i])
-                frames_buffer[i] = frame_index
-            else:
-                frames_buffer.append(frame_index)
-
-        except StopIteration:
-            del shard_iterators[shard_key]  # Remove exhausted shard
-
-    rng.shuffle(frames_buffer)
-    expected_indices.extend(frames_buffer)
-
-    return expected_indices
 
 
 @pytest.mark.parametrize("token", ["hf_test_token", True, False])
@@ -97,6 +49,7 @@ def test_streaming_dataset_forwards_hub_token_only_for_remote_data(tmp_path, mon
     monkeypatch.setattr(streaming_dataset_module, "load_dataset", load_dataset)
 
     dataset = StreamingLeRobotDataset(DUMMY_REPO_ID, root=requested_root, token=token)
+    assert dataset.hf_dataset.num_shards == 1
 
     metadata_cls.assert_called_once_with(
         DUMMY_REPO_ID,
@@ -110,7 +63,6 @@ def test_streaming_dataset_forwards_hub_token_only_for_remote_data(tmp_path, mon
         assert "token" not in load_dataset.call_args.kwargs
     else:
         assert load_dataset.call_args.kwargs["token"] is token
-    assert not hasattr(dataset, "_token")
 
 
 def test_single_frame_consistency(tmp_path, lerobot_dataset_factory):
@@ -157,103 +109,36 @@ def test_single_frame_consistency(tmp_path, lerobot_dataset_factory):
         )
 
 
-@pytest.mark.parametrize(
-    "shuffle",
-    [False, True],
-)
-def test_frames_order_over_epochs(tmp_path, lerobot_dataset_factory, shuffle):
-    """Test if streamed frames correspond to shuffling operations over in-memory dataset."""
-    ds_num_frames = 400
-    ds_num_episodes = 10
-    buffer_size = 100
-    seed = 42
-    n_epochs = 3
-
-    local_path = tmp_path / "test"
-    repo_id = f"{DUMMY_REPO_ID}"
-
+@pytest.mark.parametrize("shuffle", [False, True])
+@pytest.mark.parametrize("data_files_size_in_mb", [0.001, 100])
+def test_frames_order_over_epochs(tmp_path, lerobot_dataset_factory, shuffle, data_files_size_in_mb):
+    root = tmp_path / "dataset"
     lerobot_dataset_factory(
-        root=local_path,
-        repo_id=repo_id,
-        total_episodes=ds_num_episodes,
-        total_frames=ds_num_frames,
+        root=root,
+        repo_id=DUMMY_REPO_ID,
+        total_episodes=10,
+        total_frames=100,
+        data_files_size_in_mb=data_files_size_in_mb,
     )
+    kwargs = {"repo_id": DUMMY_REPO_ID, "root": root, "buffer_size": 4, "shuffle": shuffle}
+    first_stream = StreamingLeRobotDataset(**kwargs, seed=42)
+    same_seed = StreamingLeRobotDataset(**kwargs, seed=42)
+    other_seed = StreamingLeRobotDataset(**kwargs, seed=43)
 
-    streaming_ds = StreamingLeRobotDataset(
-        repo_id=repo_id, root=local_path, buffer_size=buffer_size, seed=seed, shuffle=shuffle
-    )
+    def ids(stream: StreamingLeRobotDataset) -> list[int]:
+        result = [sample["index"] for sample in stream]
+        assert sorted(result) == list(range(100))
+        return result
 
-    first_epoch_indices = [frame["index"] for frame in streaming_ds]
-    expected_indices = get_frames_expected_order(streaming_ds)
-
-    assert first_epoch_indices == expected_indices, "First epoch indices do not match expected indices"
-
-    expected_indices = get_frames_expected_order(streaming_ds)
-    for _ in range(n_epochs):
-        streaming_indices = [frame["index"] for frame in streaming_ds]
-        frames_match = all(
-            s_index == e_index for s_index, e_index in zip(streaming_indices, expected_indices, strict=True)
-        )
-
-        if shuffle:
-            assert not frames_match
-        else:
-            assert frames_match
-
-
-@pytest.mark.parametrize(
-    "shuffle",
-    [False, True],
-)
-def test_frames_order_with_shards(tmp_path, lerobot_dataset_factory, shuffle):
-    """Test if streamed frames correspond to shuffling operations over in-memory dataset with multiple shards."""
-    ds_num_frames = 100
-    ds_num_episodes = 10
-    buffer_size = 10
-
-    seed = 42
-    n_epochs = 3
-    data_file_size_mb = 0.001
-
-    chunks_size = 1
-
-    local_path = tmp_path / "test"
-    repo_id = f"{DUMMY_REPO_ID}-ciao"
-
-    lerobot_dataset_factory(
-        root=local_path,
-        repo_id=repo_id,
-        total_episodes=ds_num_episodes,
-        total_frames=ds_num_frames,
-        data_files_size_in_mb=data_file_size_mb,
-        chunks_size=chunks_size,
-    )
-
-    streaming_ds = StreamingLeRobotDataset(
-        repo_id=repo_id,
-        root=local_path,
-        buffer_size=buffer_size,
-        seed=seed,
-        shuffle=shuffle,
-        max_num_shards=4,
-    )
-
-    first_epoch_indices = [frame["index"] for frame in streaming_ds]
-    expected_indices = get_frames_expected_order(streaming_ds)
-
-    assert first_epoch_indices == expected_indices, "First epoch indices do not match expected indices"
-
-    for _ in range(n_epochs):
-        streaming_indices = [
-            frame["index"] for frame in streaming_ds
-        ]  # NOTE: this is the same as first_epoch_indices
-        frames_match = all(
-            s_index == e_index for s_index, e_index in zip(streaming_indices, expected_indices, strict=True)
-        )
-        if shuffle:
-            assert not frames_match
-        else:
-            assert frames_match
+    first_pass = ids(first_stream)
+    assert first_pass == ids(same_seed)
+    second_pass = ids(first_stream)
+    assert second_pass == ids(same_seed)
+    if shuffle:
+        assert first_pass != second_pass
+        assert first_pass != ids(other_seed)
+    else:
+        assert first_pass == second_pass == ids(other_seed) == list(range(100))
 
 
 def test_iter_raises_on_frame_error(tmp_path, lerobot_dataset_factory, monkeypatch):
@@ -429,17 +314,7 @@ def test_frames_with_delta_consistency_with_shards(
         seed=seed,
         shuffle=False,
         delta_timestamps=delta_timestamps,
-        max_num_shards=4,
     )
-
-    iter(streaming_ds)
-
-    num_shards = 4
-    shards_indices = []
-    for shard_idx in range(num_shards):
-        shard = safe_shard(streaming_ds.hf_dataset, shard_idx, num_shards)
-        shard_indices = [item["index"] for item in shard]
-        shards_indices.append(shard_indices)
 
     streaming_ds = iter(streaming_ds)
 
@@ -483,7 +358,7 @@ def test_frames_with_delta_consistency_with_shards(
 
 
 class _StopConstructionError(Exception):
-    """Sentinel raised from a patched load_dataset to halt __init__ after the branch under test."""
+    """Sentinel raised to check how the lazy Parquet source opens."""
 
 
 def _fake_meta(*args, **kwargs):
@@ -525,7 +400,7 @@ def test_streaming_repo_type_routes_load_dataset(repo_type, expected_source, exp
         patch("lerobot.datasets.streaming_dataset.load_dataset", fake_load_dataset),
         pytest.raises(_StopConstructionError),
     ):
-        StreamingLeRobotDataset(DUMMY_REPO_ID, repo_type=repo_type, token=token)
+        _ = StreamingLeRobotDataset(DUMMY_REPO_ID, repo_type=repo_type, token=token).hf_dataset
 
     assert captured["source"] == expected_source.format(repo_id=DUMMY_REPO_ID)
     assert captured["data_files"] == expected_data_files.format(repo_id=DUMMY_REPO_ID)
@@ -638,6 +513,7 @@ def test_bucket_root_caches_metadata_without_switching_to_local_streaming(tmp_pa
 
     assert dataset.root == tmp_path
     assert not dataset.streaming_from_local
+    assert dataset.hf_dataset.num_shards == 1
     assert mock_load_dataset.call_args.args == ("parquet",)
     assert mock_load_dataset.call_args.kwargs["data_files"].startswith("hf://buckets/")
 

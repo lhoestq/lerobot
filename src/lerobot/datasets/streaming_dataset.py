@@ -15,16 +15,18 @@
 # limitations under the License.
 import logging
 import math
+import os
 import random
 import warnings
 from collections import defaultdict, deque
-from collections.abc import Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
-from functools import partial
+from functools import cached_property, partial
 from itertools import batched, islice
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import datasets
 import numpy as np
@@ -40,7 +42,7 @@ from .depth_utils import MM_PER_METRE, dequantize_depth
 from .feature_utils import get_delta_indices
 from .io_utils import pil_to_chw_tensor
 from .language import LANGUAGE_COLUMNS
-from .utils import check_version_compatibility
+from .utils import check_version_compatibility, resolve_episode_indices
 from .video_utils import (
     _decode_torchcodec_frames,
     _match_torchcodec_frames,
@@ -60,15 +62,32 @@ _DECODER_POOL_CAPACITY = 3 * _DECODE_WORKERS
 _RGB_DECODE_GROUP_SIZE = 8
 
 
+def _balanced_episode_shards(
+    episode_indices: list[int],
+    episode_frame_counts: Mapping[int, int],
+    *,
+    world_size: int,
+) -> list[list[int]]:
+    """Assign whole episodes deterministically with greedy frame-count balancing."""
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    shards: list[list[int]] = [[] for _ in range(world_size)]
+    shard_frames = [0] * world_size
+    for episode in sorted(episode_indices, key=lambda item: (-episode_frame_counts[item], item)):
+        rank = min(range(world_size), key=lambda item: (shard_frames[item], item))
+        shards[rank].append(episode)
+        shard_frames[rank] += episode_frame_counts[episode]
+    return shards
+
+
 class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     """LeRobotDataset with streaming capabilities.
 
-    This class extends LeRobotDataset to add streaming functionality, allowing data to be streamed
-    rather than loaded entirely into memory. This is especially useful for large datasets that may
-    not fit in memory or when you want to quickly explore a dataset without downloading it completely.
+    A finite iteration covers the complete episodes owned by this data-parallel rank and
+    DataLoader worker. Each level uses deterministic frame-count balancing. Episodes stay
+    intact across Parquet row groups so temporal targets have the full episode available.
 
-    Each worker mixes samples from a pool of complete episodes. Episode read-ahead and the
-    remote video cache have separate limits.
+    Episode read-ahead and the remote video cache have separate limits.
 
     For RGB-only reads of current frames without transforms, the reader groups requests for the
     same video within eight consecutive samples. This group size is independent of the DataLoader
@@ -77,7 +96,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     Example:
         Basic usage:
         ```python
-        from lerobot.datasets import StreamingLeRobotDataset
+        from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 
         # Create a streaming dataset with delta timestamps
         delta_timestamps = {
@@ -150,8 +169,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             token: Authentication token used while streaming this dataset from
                 the Hub. Pass a string token, ``True`` to require the locally
                 stored token, ``False`` to disable authentication, or ``None``
-                to use the Hugging Face Hub default. The token is not retained
-                on the dataset instance after initialization.
+                to use the Hugging Face Hub default. DataLoader workers use it to
+                open their Parquet files.
             episode_pool_size: Complete episodes to mix per worker. If omitted, divide the
                 default of 32 across workers, round to the nearest integer and use at least one.
             prefetch_episodes: Complete Parquet episodes to read ahead per worker. Zero disables read-ahead.
@@ -199,7 +218,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.repo_type = repo_type
         self._requested_root = Path(root) if root is not None else None
         self.root = self._requested_root if self._requested_root is not None else HF_LEROBOT_HOME / repo_id
-        self.streaming_from_local = root is not None and self.repo_type in ("dataset", "bucket")
+        self.streaming_from_local = root is not None and self.repo_type == "dataset"
 
         self.image_transforms = image_transforms
         self.episodes = episodes
@@ -257,34 +276,119 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             self.delta_timestamps = delta_timestamps
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
-        token_kwargs = {} if token is None and not self.streaming_from_local else {"token": token}
-        if repo_type == "dataset":
-            dataset_path = self.repo_id
-        elif repo_type == "bucket":
-            dataset_path = "buckets/" + self.repo_id
-        else:
+        self._parquet_token = None if self.streaming_from_local else token
+        self._rank_episodes: list[int] | None = None
+        self._worker_source: tuple[list[int], datasets.IterableDataset] | None = None
+        self._epoch = 0
+
+    @cached_property
+    def hf_dataset(self) -> datasets.IterableDataset:
+        """Open the unfiltered source for a single consumer of the full dataset."""
+        token_kwargs = {} if self._parquet_token is None else {"token": self._parquet_token}
+        if self.streaming_from_local:
             dataset_path = str(self.root)
-        self.hf_dataset: datasets.IterableDataset = load_dataset(
+            data_files = "data/*/*.parquet"
+        elif self.repo_type == "dataset":
+            dataset_path = self.repo_id
+            data_files = "data/*/*.parquet"
+        else:
+            dataset_path = "parquet"
+            data_files = f"hf://buckets/{self.repo_id}/data/*/*.parquet"
+        return load_dataset(
             dataset_path,
             split="train",
             streaming=True,
-            data_files="data/*/*.parquet",
+            data_files=data_files,
             revision=self.revision,
             **token_kwargs,
         )
-        if self.hf_dataset.num_shards < 8:
-            # reshard per row group instead of per file to get more shards
-            self.hf_dataset = self.hf_dataset.reshard()
-
-        self.num_shards = self.hf_dataset.num_shards
 
     @property
-    def num_frames(self):
-        return self.meta.total_frames
+    def num_shards(self) -> int:
+        return self.hf_dataset.num_shards
+
+    @cached_property
+    def _selected_episodes(self) -> list[int]:
+        selected = resolve_episode_indices(self.episodes, self.meta.total_episodes)
+        return list(range(self.meta.total_episodes)) if selected is None else sorted(set(selected))
+
+    @cached_property
+    def _episode_frame_counts(self) -> dict[int, int]:
+        if not self._selected_episodes:
+            return {}
+        boundaries = self.meta.episodes.select_columns(["dataset_from_index", "dataset_to_index"])[:]
+        frame_counts = {
+            episode: boundaries["dataset_to_index"][episode] - boundaries["dataset_from_index"][episode]
+            for episode in self._selected_episodes
+        }
+        if any(count <= 0 for count in frame_counts.values()):
+            raise ValueError("Streaming episode lengths must be positive")
+        return frame_counts
 
     @property
-    def num_episodes(self):
-        return self.meta.total_episodes
+    def num_frames(self) -> int:
+        return self.meta.total_frames if self.episodes is None else sum(self._episode_frame_counts.values())
+
+    @property
+    def num_episodes(self) -> int:
+        return len(self._selected_episodes)
+
+    def set_data_parallel_shard(self, rank: int, world_size: int) -> None:
+        """Set the data-parallel coordinate before starting DataLoader workers."""
+        if not 0 <= rank < world_size:
+            raise ValueError(f"Invalid streaming rank/world size: rank={rank}, world_size={world_size}")
+        shards = _balanced_episode_shards(
+            self._selected_episodes, self._episode_frame_counts, world_size=world_size
+        )
+        self._rank_episodes = shards[rank]
+
+    @property
+    def num_rank_episodes(self) -> int:
+        return len(self._get_rank_episodes())
+
+    def _get_rank_episodes(self) -> list[int]:
+        if self._rank_episodes is not None:
+            return self._rank_episodes
+        if torch.distributed.is_initialized():
+            rank, world_size = torch.distributed.get_rank(), torch.distributed.get_world_size()
+        else:
+            rank, world_size = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
+        if rank == 0 and world_size == 1:
+            return self._selected_episodes
+        self.set_data_parallel_shard(rank, world_size)
+        assert self._rank_episodes is not None
+        return self._rank_episodes
+
+    def _episodes_for_worker(self, worker_id: int, num_workers: int) -> list[int]:
+        rank_episodes = self._get_rank_episodes()
+        if num_workers == 1:
+            return rank_episodes
+        shards = _balanced_episode_shards(rank_episodes, self._episode_frame_counts, world_size=num_workers)
+        return shards[worker_id]
+
+    def _stream_root(self) -> str:
+        if self.streaming_from_local:
+            return str(self.root)
+        if self.repo_type == "dataset" and self.revision:
+            return f"{self.meta.url_root}@{quote(self.revision, safe='')}"
+        return self.meta.url_root
+
+    def _owned_parquet(self, episodes: list[int]) -> datasets.IterableDataset:
+        if len(episodes) == self.meta.total_episodes:
+            return self.hf_dataset
+        if self._worker_source is None or self._worker_source[0] != episodes:
+            root = self._stream_root()
+            paths = sorted({f"{root}/{self.meta.get_data_file_path(episode)}" for episode in episodes})
+            ds = load_dataset(
+                "parquet",
+                split="train",
+                streaming=True,
+                data_files=paths,
+                filters=[("episode_index", "in", episodes)],
+                token=self._parquet_token,
+            )
+            self._worker_source = (episodes, ds)
+        return self._worker_source[1]
 
     @property
     def fps(self):
@@ -297,22 +401,19 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         worker = torch.utils.data.get_worker_info()
-        num_workers = worker.num_workers if worker is not None else 1
-        pool_size = self._episode_pool_size_for_worker(num_workers)
-        ds = self.hf_dataset.batch(by_column="episode_index")
-        if self.shuffle:
-            ds = ds.shuffle(seed=self.seed, buffer_size=1)
-        episodes = self._prefetch_episodes(iter(ds))
-
-        def samples() -> Iterator[dict[str, Any]]:
-            for pool in batched(episodes, pool_size):
-                columns = {key: [episode[key] for episode in pool] for key in pool[0]}
-                mixed = self._sample_pool_with_delta(columns)
-                for values in zip(*mixed.values(), strict=True):
-                    yield dict(zip(mixed, values, strict=True))
+        worker_id, num_workers = (worker.id, worker.num_workers) if worker is not None else (0, 1)
+        owned_episodes = self._episodes_for_worker(worker_id, num_workers)
+        if not owned_episodes:
+            return
+        seed = self.seed + self._epoch if self.shuffle else None
+        self._epoch += 1
+        ds = self._owned_parquet(owned_episodes).batch(by_column="episode_index")
+        if seed is not None:
+            # Shuffle the files. The sample pool mixes frames without a second episode buffer.
+            ds = ds.shuffle(seed=seed, buffer_size=1)
 
         with (
-            closing(episodes),
+            closing(self._prefetch_episodes(self._iter_complete_episodes(ds, owned_episodes))) as episodes,
             closing(
                 _StreamingVideoDecoderPool(
                     self._decoder_pool_capacity_for_worker(num_workers),
@@ -320,6 +421,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 )
             ) as decoder_pool,
         ):
+            samples = self._mix_episodes(episodes, self._episode_pool_size_for_worker(num_workers), seed)
             executor = ThreadPoolExecutor(self.decode_threads)
             try:
                 if (
@@ -329,9 +431,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                     and self.meta.video_keys
                     and self._uses_default_video_query()
                 ):
-                    yield from self._decode_rgb_groups(samples(), executor, decoder_pool)
+                    yield from self._decode_rgb_groups(samples, executor, decoder_pool)
                 else:
-                    yield from self._decode_samples(samples(), executor, decoder_pool)
+                    yield from self._decode_samples(samples, executor, decoder_pool)
             finally:
                 # Wait for leased decoders to return before closing their sources.
                 executor.shutdown(cancel_futures=True)
@@ -413,6 +515,39 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 yield episode
         finally:
             executor.shutdown(cancel_futures=True)
+
+    def _iter_complete_episodes(
+        self, ds: datasets.IterableDataset, owned_episodes: list[int]
+    ) -> Iterator[dict[str, Any]]:
+        remaining = set(owned_episodes)
+        # The explicit batched API consumes this worker's complete source. The default
+        # Datasets iterator would again partition its files among DataLoader workers.
+        for batch in ds.iter(batch_size=1):
+            episode = {key: values[0] for key, values in batch.items()}
+            episode_index = episode["episode_index"][0]
+            if episode_index not in remaining:
+                raise ValueError(f"Unexpected or repeated streaming episode {episode_index}")
+            expected = self._episode_frame_counts[episode_index]
+            actual = len(episode["episode_index"])
+            if actual != expected:
+                raise ValueError(
+                    f"Streaming episode {episode_index}: expected {expected} rows, found {actual}"
+                )
+            remaining.remove(episode_index)
+            yield episode
+        if remaining:
+            raise ValueError(
+                f"Missing {len(remaining)} streaming episodes, including episode {min(remaining)}"
+            )
+
+    def _mix_episodes(
+        self, episodes: Iterator[dict[str, Any]], pool_size: int, seed: int | None
+    ) -> Iterator[dict[str, Any]]:
+        for pool in batched(episodes, pool_size):
+            columns = {key: [episode[key] for episode in pool] for key in pool[0]}
+            samples = self._sample_pool_with_delta(columns, shuffle_seed=seed)
+            for values in zip(*samples.values(), strict=True):
+                yield dict(zip(samples, values, strict=True))
 
     def _uses_default_video_query(self) -> bool:
         return (
@@ -651,8 +786,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         return timestamps, padding
 
     def _video_path(self, ep_idx: int, video_key: str) -> str:
-        root = self.root if self.streaming_from_local else self.meta.url_root
-        video_path = f"{root}/{self.meta.get_video_file_path(ep_idx, video_key)}"
+        video_path = f"{self._stream_root()}/{self.meta.get_video_file_path(ep_idx, video_key)}"
         # sharedblockcache shares cached blocks safely between decode threads.
         return video_path if self.streaming_from_local else f"sharedblockcache::{video_path}"
 
