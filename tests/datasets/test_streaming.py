@@ -86,7 +86,7 @@ def test_single_frame_consistency(tmp_path, lerobot_dataset_factory):
     key_checks = []
     for _ in range(ds_num_frames):
         streaming_frame = next(streaming_ds)
-        frame_idx = streaming_frame["index"]
+        frame_idx = int(streaming_frame["index"])
         target_frame = ds[frame_idx]
 
         for key in streaming_frame:
@@ -126,7 +126,7 @@ def test_frames_order_over_epochs(tmp_path, lerobot_dataset_factory, shuffle, da
     other_seed = StreamingLeRobotDataset(**kwargs, seed=43)
 
     def ids(stream: StreamingLeRobotDataset) -> list[int]:
-        result = [sample["index"] for sample in stream]
+        result = [int(sample["index"]) for sample in stream]
         assert sorted(result) == list(range(100))
         return result
 
@@ -236,7 +236,7 @@ def test_frames_with_delta_consistency(tmp_path, lerobot_dataset_factory, state_
 
     for i in range(ds_num_frames):
         streaming_frame = next(streaming_ds)
-        frame_idx = streaming_frame["index"]
+        frame_idx = int(streaming_frame["index"])
         target_frame = ds[frame_idx]
 
         assert set(streaming_frame.keys()) == set(target_frame.keys()), (
@@ -320,7 +320,7 @@ def test_frames_with_delta_consistency_with_shards(
 
     for i in range(ds_num_frames):
         streaming_frame = next(streaming_ds)
-        frame_idx = streaming_frame["index"]
+        frame_idx = int(streaming_frame["index"])
         target_frame = ds[frame_idx]
 
         assert set(streaming_frame.keys()) == set(target_frame.keys()), (

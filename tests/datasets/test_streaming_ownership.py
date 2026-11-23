@@ -231,11 +231,11 @@ def test_direct_reader_uses_rank_environment_unless_pinned(
     dataset = StreamingLeRobotDataset(DUMMY_REPO_ID, **kwargs)
     assert dataset.num_episodes == len(LENGTHS) - 1
     assert dataset.num_frames == sum(LENGTHS[:-1])
-    assert {item["episode_index"] for item in dataset} == RANK_EPISODES[1]
+    assert {int(item["episode_index"]) for item in dataset} == RANK_EPISODES[1]
 
     dataset = StreamingLeRobotDataset(DUMMY_REPO_ID, **kwargs)
     dataset.set_data_parallel_shard(rank=0, world_size=2)
-    assert {item["episode_index"] for item in dataset} == RANK_EPISODES[0]
+    assert {int(item["episode_index"]) for item in dataset} == RANK_EPISODES[0]
 
 
 if __name__ == "__main__":
