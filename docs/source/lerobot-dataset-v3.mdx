@@ -159,6 +159,61 @@ lerobot-train \
   ...
 ```
 
+### Streaming training behavior
+
+The streaming reader assigns whole episodes by frame count, first to data-parallel ranks,
+then to each rank's DataLoader workers. It reads the Parquet files for its assigned episodes.
+A finite pass keeps partial batches. During fixed-step training, each rank starts its next
+local pass when it exhausts its own episodes. Uneven episode lengths can make that happen
+at different steps on different ranks. With the usual mean-reduced loss, DDP weights
+each rank equally. An example in a short batch therefore has more weight than an
+example in a full batch on another rank at the same step. The training log reports
+throughput using the configured batch size.
+
+Resuming a model checkpoint restores the training step and model state. The streaming
+data pass starts again, so previously consumed examples can repeat. Exact data-order
+resume and approximate shuffle-buffer restoration are not implemented in this reader.
+
+For this draft, remote video reads use the shared block cache in
+[Datasets #8983](https://github.com/huggingface/datasets/pull/8983).
+Install the revision used for the streaming tests into your training environment (after syncing, run the trainer directly from that environment):
+
+```bash
+uv pip install 'datasets @ git+https://github.com/huggingface/datasets.git@464fe790b82a320350c9c686c1b7e409323a1cf3'
+```
+
+### Set the streaming limits
+
+Each worker reads Parquet rows and mixes samples from a pool of complete episodes. A worker with
+fewer eligible episodes uses only the episodes it has. With `--num_workers=0`, the training process
+acts as one streaming worker.
+
+| Training flag | Unit and scope | Default |
+| --- | --- | --- |
+| `--dataset.streaming_episode_pool_size` | Complete episodes in the mixing pool of each worker | 32 divided by the worker count, rounded to the nearest integer with a minimum of one |
+| `--dataset.streaming_prefetch_episodes` | Complete Parquet episodes to read ahead per worker | 8. Set 0 to read in the training or DataLoader thread. |
+| `--dataset.streaming_video_cache_bytes` | Remote video file bytes retained per worker process and cache configuration | The Datasets cache default. Set 0 to disable retention. |
+| `--prefetch_factor` | Batches PyTorch requests in advance per DataLoader worker | 4 when `--num_workers` is greater than 0 |
+
+For example, `--dataset.streaming_episode_pool_size=128 --num_workers=4` lets four active
+workers mix up to 512 episodes on each rank. Episode read-ahead holds additional Parquet rows.
+Video decoding starts when a sample is requested. The training log reports each worker's limits and the potential rank totals.
+
+Within a process, matching Datasets cache configurations share the cached video bytes across files
+and threads. Each worker process can fill its own cache. The cache cap covers retained file bytes.
+Episode rows, decoded tensors, pending reads, decoder state and PyTorch queues use additional
+memory. Local video reads bypass the remote cache.
+
+When you pass an explicit Hub `token` to `StreamingLeRobotDataset`, each worker iterator uses a
+private video cache with the same byte limit. With the default token setting, Datasets shares its
+cache across matching configurations in the process. Keep one ambient Hub identity in that process.
+
+A previously set `streaming_episode_pool_size` keeps its per-worker meaning. A training config with
+the legacy `streaming_byte_budget_gb` divides that rank's GiB budget across the worker processes
+and applies each share to the remote video cache. Use `streaming_video_cache_bytes` for new runs.
+The new reader uses `streaming_prefetch_episodes` to fetch Parquet rows. Old custom settings for
+sampling strategy, native HTTP and sidecar locks require removal before you load the training config.
+
 <div style="display:flex; justify-content:center; gap:12px; flex-wrap:wrap;">
   <figure style="margin:0; text-align:center;">
     <img

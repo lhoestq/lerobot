@@ -34,6 +34,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from itertools import count
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -88,7 +89,12 @@ from lerobot.processor.rename_processor import rename_batch_keys, rename_stats
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
-from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
+from lerobot.utils.import_utils import (
+    _accelerate_available,
+    _peft_available,
+    register_third_party_plugins,
+    require_package,
+)
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
 from lerobot.utils.sample_weighting import SampleWeighter
@@ -104,6 +110,9 @@ if TYPE_CHECKING or _peft_available:
     from peft import PeftModel
 else:
     PeftModel = None
+
+if TYPE_CHECKING or _accelerate_available:
+    from accelerate.utils import send_to_device
 
 from .lerobot_eval import eval_policy_all
 
@@ -314,6 +323,21 @@ def update_policy(
     return train_metrics, output_dict
 
 
+def _iter_training_batches(dataloader: torch.utils.data.DataLoader) -> Iterator[dict[str, Any]]:
+    dataset = dataloader.dataset
+    if (
+        isinstance(dataset, StreamingLeRobotDataset)
+        and dataloader.num_workers
+        and not dataloader.persistent_workers
+    ):
+        # Without persistence, the next workers inherit the parent dataset's epoch.
+        for epoch in count():
+            dataset.set_epoch(epoch)
+            yield from dataloader
+    else:
+        yield from cycle(dataloader)
+
+
 def make_dataloaders(
     cfg: TrainPipelineConfig,
     dataset: LeRobotDataset | StreamingLeRobotDataset,
@@ -341,6 +365,7 @@ def make_dataloaders(
         dataloader and the eval dataloader (None when no eval split exists).
     """
     active_cfg = cfg.trainable_config
+    train_num_workers = cfg.num_workers
     if not cfg.dataset.streaming:
         if isinstance(dataset, StreamingLeRobotDataset):
             raise TypeError(
@@ -398,6 +423,21 @@ def make_dataloaders(
     else:
         shuffle = True
         sampler = None
+        if not isinstance(dataset, StreamingLeRobotDataset):
+            raise TypeError("Streaming training requires a StreamingLeRobotDataset.")
+        if dataset.num_episodes < parallel_dims.dp_world_size:
+            raise ValueError(
+                f"Streaming training selected {dataset.num_episodes} episodes for "
+                f"{parallel_dims.dp_world_size} data-parallel ranks. Select more episodes or use fewer ranks."
+            )
+        if step > 0 and cfg.resume and is_main_process():
+            logging.warning(
+                "Resuming training at step %d. The streaming reader restarts its data pass; "
+                "previously consumed examples can repeat.",
+                step,
+            )
+        dataset.set_data_parallel_shard(parallel_dims.dp_rank, parallel_dims.dp_world_size)
+        train_num_workers = min(cfg.num_workers, dataset.num_rank_episodes)
 
     device_type = parallel_dims.device_type
     # Only swap in the language-aware collate when the dataset actually
@@ -406,7 +446,7 @@ def make_dataloaders(
     collate_fn = lerobot_collate_fn if dataset.meta.has_language_columns else None
     dataloader = torch.utils.data.DataLoader(
         dataset,
-        num_workers=cfg.num_workers,
+        num_workers=train_num_workers,
         batch_size=cfg.batch_size,
         shuffle=shuffle and not cfg.dataset.streaming,
         sampler=sampler,
@@ -416,9 +456,9 @@ def make_dataloaders(
         pin_memory=device_type == "cuda",
         drop_last=False,
         collate_fn=collate_fn,
-        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
-        persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
-        multiprocessing_context=cfg.dataloader_multiprocessing_context if cfg.num_workers > 0 else None,
+        prefetch_factor=cfg.prefetch_factor if train_num_workers > 0 else None,
+        persistent_workers=cfg.persistent_workers and train_num_workers > 0,
+        multiprocessing_context=cfg.dataloader_multiprocessing_context if train_num_workers > 0 else None,
     )
 
     # Build eval dataloader if a held-out split exists
@@ -676,13 +716,23 @@ def train(cfg: TrainPipelineConfig) -> None:
         step = resume_before_prepare(cfg)  # step + RNG only; sharded state loads after prepare
 
     dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
+    if is_main_process() and isinstance(dataset, StreamingLeRobotDataset):
+        dataset.log_worker_limits(dataloader.num_workers, dataloader.prefetch_factor)
 
     # --- prepare & resume phase 2 ---------------------------------------------------------------
     # The FSDP wrap-unit class names resolve right before prepare: user override, else the
     # policy's _fsdp_wrap_modules declaration — root-only wrapping is never silently accepted.
     set_fsdp_wrap_modules(accelerator, policy)
     accelerator.wait_for_everyone()
-    if eval_dataloader is not None:
+    # Streaming already assigns episodes to data-parallel ranks. Preparing its DataLoader
+    # would dispatch or shard its batches again. Evaluation still uses Accelerate as usual.
+    if cfg.dataset.streaming and eval_dataloader is not None:
+        policy, optimizer, lr_scheduler, eval_dataloader = accelerator.prepare(
+            policy, optimizer, lr_scheduler, eval_dataloader
+        )
+    elif cfg.dataset.streaming:
+        policy, optimizer, lr_scheduler = accelerator.prepare(policy, optimizer, lr_scheduler)
+    elif eval_dataloader is not None:
         policy, optimizer, dataloader, lr_scheduler, eval_dataloader = accelerator.prepare(
             policy, optimizer, dataloader, lr_scheduler, eval_dataloader
         )
@@ -737,7 +787,9 @@ def train(cfg: TrainPipelineConfig) -> None:
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    dl_iter = cycle(dataloader)
+    # All ranks run the same fixed number of steps. Streaming keeps each worker's
+    # short final batch, then starts a new rank-local pass when its loader ends.
+    dl_iter = _iter_training_batches(dataloader)
     policy.train()
 
     train_metrics = {
@@ -790,6 +842,8 @@ def train(cfg: TrainPipelineConfig) -> None:
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
         batch = next(dl_iter)
+        if cfg.dataset.streaming:
+            batch = send_to_device(batch, device, non_blocking=device.type == "cuda")
         preprocessing_start = time.perf_counter()
         train_tracker.dataloading_s = preprocessing_start - step_start
         if image_augmentation is not None:

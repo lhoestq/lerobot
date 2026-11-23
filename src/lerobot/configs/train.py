@@ -149,6 +149,7 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
+    # Batches prefetched by each DataLoader worker. Only used when num_workers > 0.
     prefetch_factor: int = 4
     persistent_workers: bool = True
     # DataLoader worker start method. "spawn" is safer than "fork" with
