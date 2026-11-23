@@ -510,10 +510,10 @@ def test_bucket_root_caches_metadata_without_switching_to_local_streaming(tmp_pa
         ) as mock_load_dataset,
     ):
         dataset = StreamingLeRobotDataset(DUMMY_REPO_ID, root=tmp_path, repo_type="bucket")
+        assert dataset.hf_dataset.num_shards == 1
 
     assert dataset.root == tmp_path
     assert not dataset.streaming_from_local
-    assert dataset.hf_dataset.num_shards == 1
     assert mock_load_dataset.call_args.args == ("parquet",)
     assert mock_load_dataset.call_args.kwargs["data_files"].startswith("hf://buckets/")
 
