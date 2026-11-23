@@ -38,8 +38,7 @@ from lerobot.configs.video import RGBEncoderConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.streaming_dataset import StreamingLeRobotDataset
 from lerobot.distributed import ParallelDims
-from lerobot.scripts.lerobot_train import make_dataloaders
-from lerobot.utils.utils import cycle
+from lerobot.scripts.lerobot_train import _iter_training_batches, make_dataloaders
 from tests.fixtures.constants import DUMMY_REPO_ID
 
 pytestmark = pytest.mark.dataset
@@ -108,7 +107,6 @@ def _collect_rank(root: Path, output: Path, num_workers: int, batch_size: int, r
             episodes=SELECTED,
             buffer_size=8,
             seed=83,
-            shuffle=False,
             return_uint8=True,
         )
         cfg = SimpleNamespace(
@@ -117,7 +115,7 @@ def _collect_rank(root: Path, output: Path, num_workers: int, batch_size: int, r
             num_workers=num_workers,
             batch_size=batch_size,
             seed=83,
-            persistent_workers=True,
+            persistent_workers=num_workers > 1,
             prefetch_factor=2,
             dataloader_multiprocessing_context="spawn",
         )
@@ -139,7 +137,7 @@ def _collect_rank(root: Path, output: Path, num_workers: int, batch_size: int, r
 
         # The trainer cycles each rank locally. A distributed backward call proves that
         # both ranks continue through their different finite tail lengths.
-        batches = cycle(loader)
+        batches = _iter_training_batches(loader)
         model = DistributedDataParallel(torch.nn.Linear(2, 1))
         repeated_indices = []
         for _ in range(repeat_steps):
@@ -177,7 +175,7 @@ def test_finite_coverage_through_trainer_dataloaders(
             str(tmp_path),
             str(num_workers),
             str(batch_size),
-            str(max(batches_by_rank) + 2),
+            str(2 * max(batches_by_rank)),
         ],
         check=True,
         env=env,
@@ -205,7 +203,8 @@ def test_finite_coverage_through_trainer_dataloaders(
         }
         assert sorted(sample[0] for sample in samples) == sorted(expected_ids)
         assert set(repeated[: len(expected_ids)]) == expected_ids
-        assert len(repeated) > len(expected_ids)
+        assert set(repeated[len(expected_ids) : 2 * len(expected_ids)]) == expected_ids
+        assert repeated[: len(expected_ids)] != repeated[len(expected_ids) : 2 * len(expected_ids)]
         assert set(repeated) == expected_ids
         for index, episode, worker, action, rgb in samples:
             assert index not in seen

@@ -34,6 +34,7 @@ import sys
 import time
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from itertools import count
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -320,6 +321,21 @@ def update_policy(
     if output_dict:
         train_metrics.update_metrics(output_dict)
     return train_metrics, output_dict
+
+
+def _iter_training_batches(dataloader: torch.utils.data.DataLoader) -> Iterator[dict[str, Any]]:
+    dataset = dataloader.dataset
+    if (
+        isinstance(dataset, StreamingLeRobotDataset)
+        and dataloader.num_workers
+        and not dataloader.persistent_workers
+    ):
+        # Without persistence, the next workers inherit the parent dataset's epoch.
+        for epoch in count():
+            dataset.set_epoch(epoch)
+            yield from dataloader
+    else:
+        yield from cycle(dataloader)
 
 
 def make_dataloaders(
@@ -767,7 +783,7 @@ def train(cfg: TrainPipelineConfig) -> None:
 
     # All ranks run the same fixed number of steps. Streaming keeps each worker's
     # short final batch, then starts a new rank-local pass when its loader ends.
-    dl_iter = cycle(dataloader)
+    dl_iter = _iter_training_batches(dataloader)
     policy.train()
 
     train_metrics = {

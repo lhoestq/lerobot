@@ -373,6 +373,12 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             return f"{self.meta.url_root}@{quote(self.revision, safe='')}"
         return self.meta.url_root
 
+    def set_epoch(self, epoch: int) -> None:
+        """Set the shuffle epoch before constructing a new iterator or spawning workers."""
+        if epoch < 0:
+            raise ValueError(f"Streaming epoch must be non-negative, got {epoch}")
+        self._epoch = epoch
+
     def _owned_parquet(self, episodes: list[int]) -> datasets.IterableDataset:
         if len(episodes) == self.meta.total_episodes:
             return self.hf_dataset
