@@ -69,7 +69,7 @@ def packed_video_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
             "action": {"dtype": "float32", "shape": (2,), "names": ["episode", "frame"]},
         },
         root=root,
-        rgb_encoder=RGBEncoderConfig(vcodec="h264", g=4),
+        rgb_encoder=RGBEncoderConfig(vcodec="h264", g=4, extra_options={"bf": "0"}),
         encoder_threads=1,
     )
     for episode, length in enumerate(LENGTHS):
