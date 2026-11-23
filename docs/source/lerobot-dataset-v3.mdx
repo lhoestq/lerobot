@@ -159,6 +159,26 @@ lerobot-train \
   ...
 ```
 
+### Streaming training behavior
+
+The streaming reader assigns whole episodes by frame count, first to data-parallel ranks,
+then to each rank's DataLoader workers. It reads the Parquet files for its assigned episodes.
+A finite pass keeps partial batches. During fixed-step training, each rank starts its next
+local pass when it exhausts its own episodes. Uneven episode lengths can make that happen
+at different steps on different ranks.
+
+Resuming a model checkpoint restores the training step and model state. The streaming
+data pass starts again, so previously consumed examples can repeat. Exact data-order
+resume and approximate shuffle-buffer restoration are not implemented in this reader.
+
+For this draft, remote video reads use the shared block cache in
+[Datasets #8983](https://github.com/huggingface/datasets/pull/8983).
+Install the revision used for the streaming tests into your training environment:
+
+```bash
+uv pip install 'datasets @ git+https://github.com/huggingface/datasets.git@464fe790b82a320350c9c686c1b7e409323a1cf3'
+```
+
 ### Set the streaming limits
 
 Each worker reads Parquet rows and mixes samples from a pool of complete episodes. A worker with

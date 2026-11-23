@@ -430,6 +430,12 @@ def make_dataloaders(
                 f"Streaming training selected {dataset.num_episodes} episodes for "
                 f"{parallel_dims.dp_world_size} data-parallel ranks. Select more episodes or use fewer ranks."
             )
+        if cfg.resume and step > 0 and is_main_process():
+            logging.warning(
+                "Resuming training at step %d. The streaming reader restarts its data pass; "
+                "previously consumed examples can repeat.",
+                step,
+            )
         dataset.set_data_parallel_shard(parallel_dims.dp_rank, parallel_dims.dp_world_size)
         train_num_workers = min(cfg.num_workers, dataset.num_rank_episodes)
 
