@@ -17,6 +17,7 @@
 import hashlib
 import json
 import os
+import pickle
 import subprocess
 import sys
 from itertools import accumulate
@@ -237,6 +238,20 @@ def test_direct_reader_uses_rank_environment_unless_pinned(
     dataset = StreamingLeRobotDataset(DUMMY_REPO_ID, **kwargs)
     dataset.set_data_parallel_shard(rank=0, world_size=2)
     assert {int(item["episode_index"]) for item in dataset} == RANK_EPISODES[0]
+
+
+def test_direct_reader_preserves_process_group_rank_when_spawned(
+    packed_video_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = StreamingLeRobotDataset(DUMMY_REPO_ID, root=packed_video_root, episodes=SELECTED)
+    monkeypatch.delenv("RANK", raising=False)
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    with monkeypatch.context() as parent:
+        parent.setattr(dist, "is_initialized", lambda: True)
+        parent.setattr(dist, "get_rank", lambda: 1)
+        parent.setattr(dist, "get_world_size", lambda: 2)
+        worker_state = pickle.dumps(dataset)
+    assert {int(item["episode_index"]) for item in pickle.loads(worker_state)} == RANK_EPISODES[1]
 
 
 if __name__ == "__main__":

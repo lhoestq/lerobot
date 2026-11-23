@@ -278,8 +278,17 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         self._parquet_token = None if self.streaming_from_local else token
         self._rank_episodes: list[int] | None = None
+        self._spawned_rank: tuple[int, int] | None = None
         self._worker_source: tuple[list[int], datasets.IterableDataset] | None = None
         self._epoch = 0
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        if self._rank_episodes is None and torch.distributed.is_initialized():
+            # A spawned worker has no process group, and a manually initialized group
+            # may have no rank in the environment.
+            state["_spawned_rank"] = (torch.distributed.get_rank(), torch.distributed.get_world_size())
+        return state
 
     @cached_property
     def hf_dataset(self) -> datasets.IterableDataset:
@@ -351,6 +360,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             return self._rank_episodes
         if torch.distributed.is_initialized():
             rank, world_size = torch.distributed.get_rank(), torch.distributed.get_world_size()
+        elif self._spawned_rank is not None:
+            rank, world_size = self._spawned_rank
         else:
             rank, world_size = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
         if rank == 0 and world_size == 1:
