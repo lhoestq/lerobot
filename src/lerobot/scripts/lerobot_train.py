@@ -430,7 +430,7 @@ def make_dataloaders(
                 f"Streaming training selected {dataset.num_episodes} episodes for "
                 f"{parallel_dims.dp_world_size} data-parallel ranks. Select more episodes or use fewer ranks."
             )
-        if cfg.resume and step > 0 and is_main_process():
+        if step > 0 and cfg.resume and is_main_process():
             logging.warning(
                 "Resuming training at step %d. The streaming reader restarts its data pass; "
                 "previously consumed examples can repeat.",
