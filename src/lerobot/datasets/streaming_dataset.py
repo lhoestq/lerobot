@@ -395,8 +395,17 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         if len(episodes) == self.meta.total_episodes:
             return self.hf_dataset
         if self._worker_source is None or self._worker_source[0] != episodes:
+            chunk_column, file_column = "data/chunk_index", "data/file_index"
+            locations = self.meta.episodes.select_columns([chunk_column, file_column])[episodes]
+            file_keys = set(zip(locations[chunk_column], locations[file_column], strict=True))
+            data_path = self.meta.data_path
             root = self._stream_root()
-            paths = sorted({f"{root}/{self.meta.get_data_file_path(episode)}" for episode in episodes})
+            paths = sorted(
+                {
+                    f"{root}/{Path(data_path.format(chunk_index=chunk, file_index=file))}"
+                    for chunk, file in file_keys
+                }
+            )
             ds = load_dataset(
                 "parquet",
                 split="train",
