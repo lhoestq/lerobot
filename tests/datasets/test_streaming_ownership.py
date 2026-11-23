@@ -112,6 +112,7 @@ def _collect_rank(root: Path, output: Path, num_workers: int, batch_size: int, r
         cfg = SimpleNamespace(
             trainable_config=SimpleNamespace(),
             dataset=SimpleNamespace(streaming=True),
+            resume=False,
             num_workers=num_workers,
             batch_size=batch_size,
             seed=83,
