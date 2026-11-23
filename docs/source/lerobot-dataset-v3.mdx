@@ -201,6 +201,10 @@ and threads. Each worker process can fill its own cache. The cache cap covers re
 Episode rows, decoded tensors, pending reads, decoder state and PyTorch queues use additional
 memory. Local video reads bypass the remote cache.
 
+When you pass an explicit Hub `token` to `StreamingLeRobotDataset`, each worker iterator uses a
+private video cache with the same byte limit. With the default token setting, Datasets shares its
+cache across matching configurations in the process. Keep one ambient Hub identity in that process.
+
 A previously set `streaming_episode_pool_size` keeps its per-worker meaning. A training config with
 the legacy `streaming_byte_budget_gb` divides that rank's GiB budget across the worker processes
 and applies each share to the remote video cache. Use `streaming_video_cache_bytes` for new runs.

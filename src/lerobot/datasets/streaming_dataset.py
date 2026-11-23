@@ -32,6 +32,7 @@ import datasets
 import numpy as np
 import torch
 from datasets import load_dataset
+from fsspec.core import OpenFile
 from PIL import Image as PILImage
 
 from lerobot.configs import DEFAULT_DEPTH_UNIT, DEPTH_METER_UNIT, DepthEncoderConfig
@@ -45,8 +46,8 @@ from .language import LANGUAGE_COLUMNS
 from .utils import check_version_compatibility, resolve_episode_indices
 from .video_utils import (
     _decode_torchcodec_frames,
+    _make_streaming_video_opener,
     _match_torchcodec_frames,
-    _open_streaming_video,
     _StreamingVideoDecoderPool,
     decode_video_frames,
     decode_video_frames_torchcodec,
@@ -170,7 +171,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 the Hub. Pass a string token, ``True`` to require the locally
                 stored token, ``False`` to disable authentication, or ``None``
                 to use the Hugging Face Hub default. DataLoader workers use it to
-                open their Parquet files.
+                open their Parquet files and videos.
             episode_pool_size: Complete episodes to mix per worker. If omitted, divide the
                 default of 32 across workers, round to the nearest integer and use at least one.
             prefetch_episodes: Complete Parquet episodes to read ahead per worker. Zero disables read-ahead.
@@ -276,7 +277,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             self.delta_timestamps = delta_timestamps
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
-        self._parquet_token = None if self.streaming_from_local else token
+        self._streaming_io_token = None if self.streaming_from_local else token
         self._rank_episodes: list[int] | None = None
         self._spawned_rank: tuple[int, int] | None = None
         self._worker_source: tuple[list[int], datasets.IterableDataset] | None = None
@@ -293,7 +294,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     @cached_property
     def hf_dataset(self) -> datasets.IterableDataset:
         """Open the unfiltered source for a single consumer of the full dataset."""
-        token_kwargs = {} if self._parquet_token is None else {"token": self._parquet_token}
+        token_kwargs = {} if self._streaming_io_token is None else {"token": self._streaming_io_token}
         if self.streaming_from_local:
             dataset_path = str(self.root)
             data_files = "data/*/*.parquet"
@@ -402,7 +403,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 streaming=True,
                 data_files=paths,
                 filters=[("episode_index", "in", episodes)],
-                token=self._parquet_token,
+                token=self._streaming_io_token,
             )
             self._worker_source = (episodes, ds)
         return self._worker_source[1]
@@ -435,6 +436,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 _StreamingVideoDecoderPool(
                     self._decoder_pool_capacity_for_worker(num_workers),
                     cache_bytes=self._video_cache_bytes_for_worker(num_workers),
+                    token=self._streaming_io_token if self.meta.video_keys else None,
                 )
             ) as decoder_pool,
         ):
@@ -590,7 +592,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         query_frames: Callable[[dict[str, Any]], dict[str, Any]] = query_frames_direct
         if self._uses_default_video_query():
-            query_videos = partial(self._query_videos, read_rgb_video=read_rgb_video)
+            query_videos = partial(
+                self._query_videos, read_rgb_video=read_rgb_video, open_video=decoder_pool.open_video
+            )
             query_frames = partial(self._query_frames, query_videos=query_videos)
 
         pending: deque[Future[dict[str, Any]]] = deque()
@@ -813,16 +817,19 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         ep_idx: int,
         *,
         read_rgb_video: Callable[[str, list[float]], torch.Tensor] | None = None,
+        open_video: Callable[[str], OpenFile] | None = None,
     ) -> dict[str, torch.Tensor]:
         item = {}
-        worker = torch.utils.data.get_worker_info()
-        cache_bytes = self._video_cache_bytes_for_worker(worker.num_workers if worker is not None else 1)
+        if open_video is None:
+            worker = torch.utils.data.get_worker_info()
+            cache_bytes = self._video_cache_bytes_for_worker(worker.num_workers if worker is not None else 1)
+            open_video = _make_streaming_video_opener(cache_bytes, self._streaming_io_token)
         for video_key, query_ts in query_timestamps.items():
             video_path = self._video_path(ep_idx, video_key)
             if video_key in self.meta.depth_keys:
                 # Depth maps are 12-bit quantized and only decodable via pyav; dequantize back
                 # to physical units to match the non-streaming reader.
-                with _open_streaming_video(video_path, cache_bytes) as video_file:
+                with open_video(video_path) as video_file:
                     frames = decode_video_frames(
                         video_file,
                         query_ts,
@@ -843,7 +850,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             elif read_rgb_video is not None:
                 frames = read_rgb_video(video_path, query_ts)
             else:
-                with _open_streaming_video(video_path, cache_bytes) as video_file:
+                with open_video(video_path) as video_file:
                     frames = decode_video_frames_torchcodec(
                         video_file,
                         query_ts,

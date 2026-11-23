@@ -14,20 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from contextlib import closing
+from contextlib import closing, nullcontext
 from threading import Event
 from types import SimpleNamespace
 
 import draccus
 import fsspec
 import pytest
+import torch
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import factory, streaming_dataset as streaming
 from lerobot.datasets.storage import DEFAULT_STORAGE_FORMAT
-from lerobot.datasets.video_utils import _open_streaming_video
+from lerobot.datasets.video_utils import _make_streaming_video_opener, _open_streaming_video
 from lerobot.policies.act.configuration_act import ACTConfig
 
 pytestmark = pytest.mark.dataset
@@ -147,3 +148,52 @@ def test_remote_video_byte_limit_is_applied_to_the_shared_datasets_store():
     assert first.fs.store.stats()["max_memory"] == 5
     assert first.fs.store.stats()["cached_bytes"] == 4
     assert off.fs.store.stats()["cached_bytes"] == 0
+
+
+def test_explicit_hub_tokens_use_private_video_stores(monkeypatch):
+    pytest.importorskip("datasets.filesystems.caching", reason="Datasets shared block cache is required")
+    monkeypatch.setenv("HF_TOKEN", "test-local-hub-token")
+    path = "sharedblockcache::hf://datasets/test/stream@v3.0/video.mp4"
+
+    open_file = _make_streaming_video_opener(cache_bytes=5, token="test-explicit-hub-token")
+    first = open_file(path)
+    second = open_file(path)
+    assert first.fs.target.token == "test-explicit-hub-token"
+    assert first.fs.store is second.fs.store
+    assert first.fs is not second.fs
+    assert first.fs.store.max_memory == 5
+
+    other_tokens = [
+        ("test-other-hub-token", "test-other-hub-token"),
+        (False, False),
+        (True, "test-local-hub-token"),
+        (None, None),
+    ]
+    stores = [first.fs.store]
+    for token, expected in other_tokens:
+        other = _make_streaming_video_opener(cache_bytes=5, token=token)(path)
+        assert other.fs.target.token == expected
+        assert all(other.fs.store is not store for store in stores)
+        stores.append(other.fs.store)
+
+
+def test_remote_dataset_forwards_video_token_on_direct_read(streaming_factory, monkeypatch):
+    pytest.importorskip("datasets.filesystems.caching", reason="Datasets shared block cache is required")
+    dataset = streaming.StreamingLeRobotDataset("test/stream", token="test-explicit-hub-token")
+    path = "sharedblockcache::hf://datasets/test/stream@v3.0/video.mp4"
+    monkeypatch.setattr(dataset, "_video_path", lambda *_: path)
+
+    fsspec_open = fsspec.open
+    opened = []
+
+    def open_without_io(*args, **kwargs):
+        file = fsspec_open(*args, **kwargs)
+        opened.append(file)
+        return nullcontext(file)
+
+    monkeypatch.setattr(fsspec, "open", open_without_io)
+    monkeypatch.setattr(streaming, "decode_video_frames_torchcodec", lambda *_, **__: torch.zeros(1, 3, 2, 2))
+
+    assert dataset._query_videos({"camera": [0.0]}, 0)["camera"].shape == (3, 2, 2)
+    assert len(opened) == 1
+    assert opened[0].fs.target.token == "test-explicit-hub-token"

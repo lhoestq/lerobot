@@ -22,9 +22,10 @@ import shutil
 import tempfile
 import threading
 import warnings
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from fractions import Fraction
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, ClassVar
 
@@ -34,6 +35,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 from datasets.features.features import register_feature
+from huggingface_hub.utils import get_token_to_send
 from PIL import Image
 
 from lerobot.configs import (
@@ -273,6 +275,32 @@ def _open_streaming_video(path: str, cache_bytes: int | None = None) -> fsspec.c
     return fsspec.open(path, sharedblockcache={"max_memory": cache_bytes})
 
 
+def _make_streaming_video_opener(
+    cache_bytes: int | None, token: str | bool | None
+) -> Callable[[str], fsspec.core.OpenFile]:
+    open_video = partial(_open_streaming_video, cache_bytes=cache_bytes)
+    if token is None:
+        return open_video
+
+    from datasets.filesystems.caching import DEFAULT_MAX_MEMORY, SharedBlockCache
+
+    resolved_token = get_token_to_send(token)
+    store = SharedBlockCache(max_memory=DEFAULT_MAX_MEMORY if cache_bytes is None else cache_bytes)
+
+    def open_with_token(path: str) -> fsspec.core.OpenFile:
+        if not path.startswith("sharedblockcache::hf://"):
+            return open_video(path)
+        # Datasets' default store identifies file versions by URL and metadata, without credentials.
+        # Scope this store to the reader and keep it out of fsspec's instance cache.
+        return fsspec.open(
+            path,
+            sharedblockcache={"store": store, "skip_instance_cache": True},
+            hf={"token": False if resolved_token is None else resolved_token},
+        )
+
+    return open_with_token
+
+
 class _StreamingVideoDecoderPool:
     """Keep a bounded set of open decoders for one streaming iterator.
 
@@ -280,11 +308,11 @@ class _StreamingVideoDecoderPool:
     one path can use separate decoders, and eviction only closes idle entries.
     """
 
-    def __init__(self, capacity: int, *, cache_bytes: int | None = None):
+    def __init__(self, capacity: int, *, cache_bytes: int | None = None, token: str | bool | None = None):
         if capacity < 1:
             raise ValueError("The video decoder pool requires a positive capacity")
         self._capacity = capacity
-        self._cache_bytes = cache_bytes
+        self.open_video = _make_streaming_video_opener(cache_bytes, token)
         self._condition = threading.Condition()
         self._size = 0
         self._idle: list[_StreamingVideoDecoderEntry] = []
@@ -308,7 +336,7 @@ class _StreamingVideoDecoderPool:
         try:
             if evicted_resources is not None:
                 evicted_resources.close()
-            video_file = resources.enter_context(_open_streaming_video(path, self._cache_bytes))
+            video_file = resources.enter_context(self.open_video(path))
             decoder = VideoDecoder(video_file, seek_mode="approximate")
         except BaseException:
             self._discard(resources)
