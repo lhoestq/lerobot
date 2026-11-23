@@ -25,8 +25,10 @@ from typing import Any, Literal
 
 import datasets
 import fsspec
+import numpy as np
 import torch
 from datasets import load_dataset
+from PIL import Image as PILImage
 
 from lerobot.configs import DEFAULT_DEPTH_UNIT, DEPTH_METER_UNIT, DepthEncoderConfig
 from lerobot.utils.constants import HF_LEROBOT_HOME
@@ -34,12 +36,9 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 from .dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
 from .depth_utils import MM_PER_METRE, dequantize_depth
 from .feature_utils import get_delta_indices
-from .io_utils import item_to_torch
-from .utils import (
-    check_version_compatibility,
-    find_float_index,
-    is_float_in_list,
-)
+from .io_utils import pil_to_chw_tensor
+from .language import LANGUAGE_COLUMNS
+from .utils import check_version_compatibility
 from .video_utils import (
     _decode_torchcodec_frames,
     _match_torchcodec_frames,
@@ -297,38 +296,49 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         while pending:
             yield pending.popleft().result()
 
-    def _sample_pool_with_delta(self, episodes_batch):
-        episode_batches = [
+    def _sample_pool_with_delta(
+        self, episodes_batch: dict[str, list[list[Any]]], *, shuffle_seed: int | None = 42
+    ) -> dict[str, list[Any]]:
+        episode_batches: list[dict[str, Any]] = [
             {col: episodes_batch[col][ep] for col in episodes_batch}
             for ep in range(len(episodes_batch["episode_index"]))
         ]
         for episode_batch in episode_batches:
-            episode_batch = item_to_torch(episode_batch)
+            for key, values in episode_batch.items():
+                if key == "task" or key in LANGUAGE_COLUMNS:
+                    continue
+                first = values[0]
+                if first is None or isinstance(first, (str, bytes, dict)):
+                    continue
+                if isinstance(first, PILImage.Image):
+                    episode_batch[key] = torch.stack([pil_to_chw_tensor(image) for image in values])
+                    continue
+                try:
+                    array = np.asarray(values)
+                except ValueError:
+                    # Variable-length annotations can be ragged.
+                    continue
+                if array.dtype.kind in "biuf":
+                    dtype = torch.get_default_dtype() if array.dtype.kind == "f" else None
+                    episode_batch[key] = torch.as_tensor(array, dtype=dtype)
+
             if self.delta_indices is not None:
                 query_results, paddings = self._get_delta_frames(episode_batch)
                 episode_batch.update(query_results)
                 episode_batch.update(paddings)
+
         samples = [
             (ep, frame)
             for ep in range(len(episode_batches))
             for frame in range(len(episode_batches[ep]["episode_index"]))
         ]
-        random.Random("|".join(str(ep[0]) for ep in episodes_batch["episode_index"])).shuffle(samples)
-        out = {col: [episode_batches[ep][col][frame] for ep, frame in samples] for col in episodes_batch}
-        return out
+        if shuffle_seed is not None:
+            pool_key = "|".join(str(ep[0]) for ep in episodes_batch["episode_index"])
+            if shuffle_seed != 42:
+                pool_key = f"{shuffle_seed}:{pool_key}"
+            random.Random(pool_key).shuffle(samples)
 
-    def _make_timestamps_from_indices(
-        self, start_ts: float, indices: dict[str, list[int]] | None = None
-    ) -> dict[str, list[float]]:
-        if indices is not None:
-            return {
-                key: (
-                    start_ts + torch.tensor(indices[key]) / self.fps
-                ).tolist()  # NOTE: why not delta_timestamps directly?
-                for key in indices
-            }
-        else:
-            return dict.fromkeys(self.meta.video_keys, [start_ts])
+        return {col: [episode_batches[ep][col][frame] for ep, frame in samples] for col in episode_batches[0]}
 
     def _decode_rgb_groups(
         self,
@@ -358,8 +368,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         try:
             for row, sample in enumerate(group):
                 episode = int(sample["episode_index"])
-                timestamp = int(sample["frame_index"]) / self.fps
-                for key, (query_timestamp,) in self._get_video_query_timestamps(episode, timestamp).items():
+                frame = int(sample["frame_index"])
+                video_queries, _ = self._get_video_queries(episode, frame)
+                for key, (query_timestamp,) in video_queries.items():
                     path = self._video_path(episode, key)
                     requests_by_path[path].append((row, key, query_timestamp))
         except Exception:
@@ -428,37 +439,6 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 frames.append(frame.squeeze(0))
             return frames
 
-    def _make_padding_camera_frame(self, camera_key: str):
-        """Variable-shape padding frame for given camera keys, given in (H, W, C)"""
-        return torch.zeros(self.meta.info.features[camera_key]["shape"]).permute(-1, 0, 1)
-
-    def _get_video_frame_padding_mask(
-        self,
-        video_frames: dict[str, torch.Tensor],
-        query_timestamps: dict[str, list[float]],
-        original_timestamps: dict[str, list[float]],
-    ) -> dict[str, torch.BoolTensor]:
-        padding_mask = {}
-
-        for video_key, timestamps in original_timestamps.items():
-            if video_key not in video_frames:
-                continue  # only padding on video keys that are available
-            frames = []
-            mask = []
-            padding_frame = self._make_padding_camera_frame(video_key)
-            for ts in timestamps:
-                if is_float_in_list(ts, query_timestamps[video_key]):
-                    idx = find_float_index(ts, query_timestamps[video_key])
-                    frames.append(video_frames[video_key][idx, :])
-                    mask.append(False)
-                else:
-                    frames.append(padding_frame)
-                    mask.append(True)
-
-            padding_mask[f"{video_key}_is_pad"] = torch.BoolTensor(mask)
-
-        return padding_mask
-
     def query_frames(self, item: dict[str, Any]) -> dict[str, Any]:
         return self._query_frames(item, self._query_videos)
 
@@ -469,35 +449,16 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     ) -> dict[str, Any]:
         ep_idx = int(item["episode_index"])
         task_idx = int(item["task_index"])
-        current_ts = int(item["frame_index"]) / self.fps
-
-        updates = []
-
-        # Load video frames, when needed
-        if len(self.meta.video_keys) > 0:
-            original_timestamps = self._make_timestamps_from_indices(current_ts, self.delta_indices)
-
-            # Some timestamps might not result available considering the episode's boundaries
-            query_timestamps = self._get_video_query_timestamps(ep_idx, current_ts)
-            video_frames = query_videos(query_timestamps, ep_idx)
-
-            if self.image_transforms is not None:
-                image_keys = self.meta.camera_keys
-                for cam in image_keys:
-                    video_frames[cam] = self.image_transforms(video_frames[cam])
-
-            updates.append(video_frames)
-
-            if self.delta_indices is not None:
-                # We always return the same number of frames. Unavailable frames are padded.
-                padding_mask = self._get_video_frame_padding_mask(
-                    video_frames, query_timestamps, original_timestamps
-                )
-                updates.append(padding_mask)
-
         result = item.copy()
-        for update in updates:
-            result.update(update)
+        if self.meta.video_keys:
+            timestamps, padding = self._get_video_queries(ep_idx, int(item["frame_index"]))
+            result.update(query_videos(timestamps, ep_idx))
+            result.update(padding)
+
+        if self.image_transforms is not None:
+            for key in self.meta.camera_keys:
+                if key in result and key not in self.meta.depth_keys:
+                    result[key] = self.image_transforms(result[key])
 
         # Convert raw-image depth features to the output unit (video depth is already converted).
         for key, stored_unit in self._image_depth_units.items():
@@ -512,32 +473,28 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         return result
 
-    def _get_query_timestamps(
-        self,
-        current_ts: float,
-        query_indices: dict[str, list[int]] | None,
-        episode_boundaries_ts: dict[str, tuple[float, float]],
-    ) -> dict[str, list[float]]:
-        query_timestamps = {}
-        keys_to_timestamps = self._make_timestamps_from_indices(current_ts, query_indices)
-        for key in self.meta.video_keys:
-            timestamps = keys_to_timestamps[key]
-            # Clamp out timesteps outside of episode boundaries
-            query_timestamps[key] = torch.clamp(
-                torch.tensor(timestamps) + episode_boundaries_ts[key][0], *episode_boundaries_ts[key]
-            ).tolist()
-        return query_timestamps
-
-    def _get_video_query_timestamps(self, episode: int, timestamp: float) -> dict[str, list[float]]:
+    def _get_video_queries(
+        self, episode: int, frame: int
+    ) -> tuple[dict[str, list[float]], dict[str, torch.Tensor]]:
         episode_metadata = self.meta.episodes[episode]
-        episode_boundaries = {
-            key: (
-                episode_metadata[f"videos/{key}/from_timestamp"],
-                episode_metadata[f"videos/{key}/to_timestamp"],
+        last_frame = episode_metadata["length"] - 1
+        timestamps = {}
+        padding = {}
+        for key in self.meta.video_keys:
+            offsets = self.delta_indices.get(key) if self.delta_indices is not None else None
+            start = episode_metadata[f"videos/{key}/from_timestamp"]
+            if offsets is None:
+                timestamps[key] = [start + frame / self.fps]
+                continue
+
+            requested = [frame + offset for offset in offsets]
+            clipped = [max(0, min(index, last_frame)) for index in requested]
+            # Add each camera's MP4 offset in double precision after clipping in episode frame units.
+            timestamps[key] = [start + index / self.fps for index in clipped]
+            padding[f"{key}_is_pad"] = torch.tensor(
+                [index != bound for index, bound in zip(requested, clipped, strict=True)], dtype=torch.bool
             )
-            for key in self.meta.video_keys
-        }
-        return self._get_query_timestamps(timestamp, self.delta_indices, episode_boundaries)
+        return timestamps, padding
 
     def _video_path(self, ep_idx: int, video_key: str) -> str:
         root = self.root if self.streaming_from_local else self.meta.url_root
@@ -591,100 +548,29 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
 
         return item
 
-    def _get_delta_frames(self, episode_batch) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
-        """Get frames with delta offsets for every step.
-
-        Args:
-            episode_batch (dict): Batch containing all the data from one episode.
-                Generally obtained using `ds.batch(by_column="episode_index")`.
-                Values in the dictionary are lists of the same length (one item per step)
-
-        Returns:
-            tuple: (query_result, padding) - frames at delta offsets and padding info.
-        """
-        num_steps = len(episode_batch["episode_index"])
+    def _get_delta_frames(
+        self, episode_batch: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
+        """Gather each non-video window and its padding mask within one episode."""
         if self.delta_indices is None:
             raise RuntimeError("Delta frames were requested but no delta_timestamps are configured.")
 
-        # Prepare results
-        query_results: dict[str, list[torch.Tensor]] = {key: [] for key in self.delta_indices}
-        paddings: dict[str, list[torch.Tensor]] = {key: [] for key in self.delta_indices}
-
-        for key, delta_indices in self.delta_indices.items():
+        num_steps = len(episode_batch["episode_index"])
+        anchors = torch.arange(num_steps).unsqueeze(1)
+        frames = {}
+        padding = {}
+        for key, offsets in self.delta_indices.items():
             if key in self.meta.video_keys:
-                continue  # visual frames are decoded separately
-
-            for index in range(num_steps):
-                current_item = {k: episode_batch[k][index] for k in episode_batch}
-                target_frames = []
-                is_pad = []
-
-                # Create a results dictionary to store frames in processing order, then reconstruct original order for stacking
-                delta_results = {}
-
-                # Separate and sort deltas by difficulty (easier operations first)
-                negative_deltas = sorted(
-                    [d for d in delta_indices if d < 0], reverse=True
-                )  # [-1, -2, -3, ...]
-                positive_deltas = sorted([d for d in delta_indices if d > 0])  # [1, 2, 3, ...]
-                zero_deltas = [d for d in delta_indices if d == 0]
-
-                # Process zero deltas (current frame)
-                for delta in zero_deltas:
-                    delta_results[delta] = (
-                        current_item,
-                        False,
-                    )
-
-                # Process negative deltas in order of increasing difficulty
-                lookback_failed = False
-
-                last_successful_frame = current_item[key]
-
-                for delta in negative_deltas:
-                    if lookback_failed:
-                        delta_results[delta] = (last_successful_frame, True)
-                        continue
-
-                    if index + delta > 0:
-                        past_item = {k: episode_batch[k][index + delta] for k in episode_batch}
-                        delta_results[delta] = (past_item[key], False)
-                        last_successful_frame = past_item[key]
-                    else:
-                        delta_results[delta] = (last_successful_frame, True)
-                        lookback_failed = True  # All subsequent negative deltas will also fail
-
-                # Process positive deltas in order of increasing difficulty
-                lookahead_failed = False
-                last_successful_frame = current_item[key]
-
-                for delta in positive_deltas:
-                    if lookahead_failed:
-                        delta_results[delta] = (last_successful_frame, True)
-                        continue
-
-                    if index + delta < num_steps:
-                        future_item = {k: episode_batch[k][index + delta] for k in episode_batch}
-                        delta_results[delta] = (future_item[key], False)
-                        last_successful_frame = future_item[key]
-                    else:
-                        delta_results[delta] = (last_successful_frame, True)
-                        lookahead_failed = True  # All subsequent positive deltas will also fail
-
-                # Reconstruct original order for stacking
-                for delta in delta_indices:
-                    frame, is_padded = delta_results[delta]
-
-                    # add batch dimension for stacking
-                    target_frames.append(frame)  # frame.unsqueeze(0))
-                    is_pad.append(is_padded)
-
-                # Stack frames and add to results
-                if target_frames:
-                    query_results[key].append(torch.stack(target_frames))
-                    paddings[f"{key}_is_pad"].append(torch.BoolTensor(is_pad))
-
-        return query_results, paddings
+                continue
+            requested = anchors + torch.tensor(offsets, dtype=torch.long)
+            clipped = requested.clamp(0, num_steps - 1)
+            values = episode_batch[key]
+            if isinstance(values, torch.Tensor):
+                frames[key] = values[clipped]
+            else:
+                frames[key] = [[values[index] for index in window] for window in clipped.tolist()]
+            padding[f"{key}_is_pad"] = requested != clipped
+        return frames, padding
 
     def _validate_delta_timestamp_keys(self, delta_timestamps: dict[str, list[float]] | None) -> None:
         """

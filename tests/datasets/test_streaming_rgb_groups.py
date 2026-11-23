@@ -16,8 +16,11 @@
 
 from contextlib import closing
 from pathlib import Path
+from shutil import copytree
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 import torch
 from torch.utils.data import DataLoader
@@ -172,3 +175,47 @@ def test_grouped_stream_yields_valid_prefix_before_decode_error(rgb_stream_root,
         assert [next(samples)["index"] for _ in range(valid_prefix_length)] == order[:valid_prefix_length]
         with pytest.raises(FrameTimestampError):
             next(samples)
+
+
+@pytest.mark.parametrize("action_offsets", [tuple(range(100)), (1, 3)])
+def test_temporal_stream_matches_map_reader(rgb_stream_root, action_offsets):
+    action_key = "action"
+    fps = 25
+    delta_timestamps = {
+        action_key: [offset / fps for offset in action_offsets],
+        CAMERAS[0]: [offset / fps for offset in (-4, 0, 3, -4)],
+    }
+    kwargs = {"root": rgb_stream_root, "delta_timestamps": delta_timestamps, "return_uint8": True}
+    reference = LeRobotDataset(DUMMY_REPO_ID, video_backend="torchcodec", **kwargs)
+    stream = StreamingLeRobotDataset(str(rgb_stream_root), **kwargs)
+
+    ids = []
+    for sample in stream:
+        index = int(sample["index"])
+        ids.append(index)
+        expected = reference[index]
+        assert sample.keys() == expected.keys()
+        assert sample["task"] == expected["task"]
+        for key in sample.keys() - {"task"}:
+            torch.testing.assert_close(sample[key], expected[key], rtol=0, atol=0)
+
+    assert sorted(ids) == list(range(sum(EPISODE_LENGTHS)))
+
+
+def test_streaming_preserves_text_columns(rgb_stream_root, tmp_path):
+    root = copytree(rgb_stream_root, tmp_path / "with_text")
+    for path in root.glob("data/*/*.parquet"):
+        table = pq.read_table(path)
+        instructions = ["move the arm" if index % 2 else "" for index in table["index"].to_pylist()]
+        aliases = [[instruction, "pick"] if instruction else [] for instruction in instructions]
+        table = table.append_column("language_instruction", pa.array(instructions))
+        table = table.append_column("instruction_aliases", pa.array(aliases))
+        pq.write_table(table, path)
+
+    stream = StreamingLeRobotDataset(str(root), root=root, delta_timestamps={"action": [0.0]})
+    samples = sorted(stream, key=lambda sample: int(sample["index"]))
+    assert [int(sample["index"]) for sample in samples] == list(range(sum(EPISODE_LENGTHS)))
+    for index, sample in enumerate(samples):
+        assert sample["language_instruction"] == ("move the arm" if index % 2 else "")
+        assert sample["instruction_aliases"] == (["move the arm", "pick"] if index % 2 else [])
+        assert sample["action"].shape == (1, 2)
