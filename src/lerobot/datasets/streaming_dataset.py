@@ -13,9 +13,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import logging
+import math
 import random
+import warnings
 from collections import defaultdict, deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import closing
 from functools import partial
@@ -24,7 +27,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 import datasets
-import fsspec
 import numpy as np
 import torch
 from datasets import load_dataset
@@ -42,11 +44,16 @@ from .utils import check_version_compatibility
 from .video_utils import (
     _decode_torchcodec_frames,
     _match_torchcodec_frames,
+    _open_streaming_video,
     _StreamingVideoDecoderPool,
     decode_video_frames,
     decode_video_frames_torchcodec,
 )
 
+logger = logging.getLogger(__name__)
+
+DEFAULT_STREAMING_SEED = 42
+_DEFAULT_EPISODE_POOL_SIZE = 32
 _DECODE_WORKERS = 32
 # Retain several camera decoders per concurrent sample while bounding open sources.
 _DECODER_POOL_CAPACITY = 3 * _DECODE_WORKERS
@@ -60,9 +67,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     rather than loaded entirely into memory. This is especially useful for large datasets that may
     not fit in memory or when you want to quickly explore a dataset without downloading it completely.
 
-    The key innovation is using a Backtrackable iterator that maintains a bounded buffer of recent
-    items, allowing us to access previous frames for delta timestamps without loading the entire
-    dataset into memory.
+    Each worker mixes samples from a pool of complete episodes. Episode read-ahead and the
+    remote video cache have separate limits.
 
     For RGB-only reads of current frames without transforms, the reader groups requests for the
     same video within eight consecutive samples. This group size is independent of the DataLoader
@@ -71,7 +77,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     Example:
         Basic usage:
         ```python
-        from lerobot.common.datasets.streaming_dataset import StreamingLeRobotDataset
+        from lerobot.datasets import StreamingLeRobotDataset
 
         # Create a streaming dataset with delta timestamps
         delta_timestamps = {
@@ -82,8 +88,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         dataset = StreamingLeRobotDataset(
             repo_id="your-dataset-repo-id",
             delta_timestamps=delta_timestamps,
-            streaming=True,
-            buffer_size=1000,
+            episode_pool_size=32,
         )
 
         # Iterate over the dataset
@@ -105,14 +110,22 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         tolerance_s: float = 1e-4,
         revision: str | None = None,
         force_cache_sync: bool = False,
-        buffer_size: int = 32,
-        seed: int = 42,
+        buffer_size: int | None = None,
+        seed: int = DEFAULT_STREAMING_SEED,
         shuffle: bool = True,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
         *,
         repo_type: Literal["dataset", "bucket"] = "dataset",
         token: str | bool | None = None,
+        episode_pool_size: int | None = None,
+        prefetch_episodes: int = 8,
+        video_cache_bytes: int | None = None,
+        byte_budget_gb: float | None = None,
+        decode_threads: int = _DECODE_WORKERS,
+        decoded_queue_size: int = _DECODE_WORKERS,
+        video_decoder_cache_size: int | None = None,
+        max_num_shards: int | None = None,
     ):
         """Initialize a StreamingLeRobotDataset.
 
@@ -127,7 +140,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             tolerance_s (float, optional): Tolerance in seconds for timestamp matching.
             revision (str, optional): Git revision id (branch name, tag, or commit hash).
             force_cache_sync (bool, optional): Flag to sync and refresh local files first.
-            buffer_size (int, optional): Buffer size for shuffling when streaming. Defaults to 32.
+            buffer_size: Legacy alias for the per-worker episode pool size.
             seed (int, optional): Reproducibility random seed.
             shuffle (bool, optional): Whether to shuffle the dataset across exhaustions. Defaults to True.
             depth_output_unit (str, optional): Physical unit depth maps are dequantized to ("m" or "mm").
@@ -139,10 +152,48 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                 stored token, ``False`` to disable authentication, or ``None``
                 to use the Hugging Face Hub default. The token is not retained
                 on the dataset instance after initialization.
+            episode_pool_size: Complete episodes to mix per worker. If omitted, divide the
+                default of 32 across workers, round to the nearest integer and use at least one.
+            prefetch_episodes: Complete Parquet episodes to read ahead per worker. Zero disables read-ahead.
+            video_cache_bytes: Maximum cached remote video bytes per worker process and cache
+                configuration. Zero disables retention. None uses the Datasets cache default.
+            byte_budget_gb: Legacy per-rank budget in GiB, divided across worker processes and
+                applied to cached remote video bytes. Use video_cache_bytes for new datasets.
+            decode_threads: Maximum parallel video decode calls per worker.
+            decoded_queue_size: Maximum pending sample requests per worker's decode queue.
+            video_decoder_cache_size: Legacy per-rank maximum open RGB decoders, divided across workers.
+            max_num_shards: Deprecated. Worker ownership determines which shards to read.
         """
         super().__init__()
         if repo_type not in ("dataset", "bucket"):
             raise ValueError(f"repo_type must be 'dataset' or 'bucket', got {repo_type!r}")
+
+        if episode_pool_size is not None and buffer_size is not None:
+            raise ValueError("Set episode_pool_size or buffer_size.")
+        for name, value in (
+            ("episode_pool_size", episode_pool_size),
+            ("buffer_size", buffer_size),
+            ("decode_threads", decode_threads),
+            ("decoded_queue_size", decoded_queue_size),
+            ("video_decoder_cache_size", video_decoder_cache_size),
+        ):
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive.")
+        if prefetch_episodes < 0:
+            raise ValueError("prefetch_episodes must be non-negative.")
+        if video_cache_bytes is not None and video_cache_bytes < 0:
+            raise ValueError("video_cache_bytes must be non-negative.")
+        if byte_budget_gb is not None:
+            if not math.isfinite(byte_budget_gb) or byte_budget_gb <= 0:
+                raise ValueError("byte_budget_gb must be finite and positive.")
+            if video_cache_bytes is not None:
+                raise ValueError("Set video_cache_bytes or byte_budget_gb.")
+        if max_num_shards is not None:
+            warnings.warn(
+                "max_num_shards is deprecated. Streaming workers now read their assigned episodes.",
+                FutureWarning,
+                stacklevel=2,
+            )
 
         self.repo_id = repo_id
         self.repo_type = repo_type
@@ -157,7 +208,14 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.seed = seed
         self.shuffle = shuffle
 
-        self.buffer_size = buffer_size
+        self.episode_pool_size = episode_pool_size if episode_pool_size is not None else buffer_size
+        self.buffer_size = self.episode_pool_size or _DEFAULT_EPISODE_POOL_SIZE
+        self.prefetch_episodes = prefetch_episodes
+        self.video_cache_bytes = video_cache_bytes
+        self.byte_budget_gb = byte_budget_gb
+        self.decode_threads = decode_threads
+        self.decoded_queue_size = decoded_queue_size
+        self.video_decoder_cache_size = video_decoder_cache_size
         self._return_uint8 = return_uint8
         self._depth_output_unit = depth_output_unit
 
@@ -238,14 +296,31 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         return self._depth_output_unit
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
-        ds = self.hf_dataset
-        ds = ds.batch(by_column="episode_index")
-        ds = ds.shuffle(seed=42, buffer_size=self.buffer_size)
+        worker = torch.utils.data.get_worker_info()
+        num_workers = worker.num_workers if worker is not None else 1
+        pool_size = self._episode_pool_size_for_worker(num_workers)
+        ds = self.hf_dataset.batch(by_column="episode_index")
+        if self.shuffle:
+            ds = ds.shuffle(seed=self.seed, buffer_size=1)
+        episodes = self._prefetch_episodes(iter(ds))
 
-        ds = ds.map(self._sample_pool_with_delta, batched=True, batch_size=self.buffer_size)
+        def samples() -> Iterator[dict[str, Any]]:
+            for pool in batched(episodes, pool_size):
+                columns = {key: [episode[key] for episode in pool] for key in pool[0]}
+                mixed = self._sample_pool_with_delta(columns)
+                for values in zip(*mixed.values(), strict=True):
+                    yield dict(zip(mixed, values, strict=True))
 
-        with closing(_StreamingVideoDecoderPool(_DECODER_POOL_CAPACITY)) as decoder_pool:
-            executor = ThreadPoolExecutor(_DECODE_WORKERS)
+        with (
+            closing(episodes),
+            closing(
+                _StreamingVideoDecoderPool(
+                    self._decoder_pool_capacity_for_worker(num_workers),
+                    cache_bytes=self._video_cache_bytes_for_worker(num_workers),
+                )
+            ) as decoder_pool,
+        ):
+            executor = ThreadPoolExecutor(self.decode_threads)
             try:
                 if (
                     self.delta_indices is None
@@ -254,12 +329,90 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
                     and self.meta.video_keys
                     and self._uses_default_video_query()
                 ):
-                    yield from self._decode_rgb_groups(iter(ds), executor, decoder_pool)
+                    yield from self._decode_rgb_groups(samples(), executor, decoder_pool)
                 else:
-                    yield from self._decode_samples(iter(ds), executor, decoder_pool)
+                    yield from self._decode_samples(samples(), executor, decoder_pool)
             finally:
                 # Wait for leased decoders to return before closing their sources.
                 executor.shutdown(cancel_futures=True)
+
+    def _episode_pool_size_for_worker(self, num_workers: int) -> int:
+        if self.episode_pool_size is not None:
+            return self.episode_pool_size
+        return max(1, round(_DEFAULT_EPISODE_POOL_SIZE / max(1, num_workers)))
+
+    def _decoder_pool_capacity_for_worker(self, num_workers: int) -> int:
+        if self.video_decoder_cache_size is not None:
+            return max(1, self.video_decoder_cache_size // max(1, num_workers))
+        return _DECODER_POOL_CAPACITY
+
+    def _video_cache_bytes_for_worker(self, num_workers: int) -> int | None:
+        if self.byte_budget_gb is not None:
+            numerator, denominator = self.byte_budget_gb.as_integer_ratio()
+            return (numerator << 30) // (denominator * max(1, num_workers))
+        return self.video_cache_bytes
+
+    def log_worker_limits(self, num_workers: int, dataloader_prefetch_factor: int | None) -> None:
+        """Log per-worker limits and the total if every worker on the rank is active."""
+        workers = max(1, num_workers)
+        pool_size = self._episode_pool_size_for_worker(workers)
+        logger.info(
+            "Streaming episode pool: %d episodes per worker, up to %d per rank. Worker count per rank: %d.",
+            pool_size,
+            pool_size * workers,
+            workers,
+        )
+        logger.info(
+            "Streaming episode read-ahead: %d Parquet episodes per worker, up to %d per rank.",
+            self.prefetch_episodes,
+            self.prefetch_episodes * workers,
+        )
+        logger.info(
+            "Streaming decode queue: %d samples per worker, up to %d per rank.",
+            self.decoded_queue_size,
+            self.decoded_queue_size * workers,
+        )
+        prefetch_batches = dataloader_prefetch_factor or 0
+        logger.info(
+            "DataLoader prefetch: %d batches per worker, up to %d per rank.",
+            prefetch_batches,
+            prefetch_batches * workers,
+        )
+        if self.streaming_from_local or not self.meta.video_keys:
+            return
+        from datasets.filesystems.caching import DEFAULT_MAX_MEMORY
+
+        cache_bytes = self._video_cache_bytes_for_worker(workers)
+        if cache_bytes is None:
+            cache_bytes = DEFAULT_MAX_MEMORY
+        logger.info(
+            "Streaming remote video cache: %s bytes per worker process and cache configuration, "
+            "up to %s cached bytes per rank across worker processes.",
+            f"{cache_bytes:,}",
+            f"{cache_bytes * workers:,}",
+        )
+        if self.byte_budget_gb is not None:
+            logger.info(
+                "Converted the legacy streaming_byte_budget_gb value to a per-process remote video "
+                "cache cap. Use streaming_video_cache_bytes for new runs."
+            )
+
+    def _prefetch_episodes(self, episodes: Iterator[dict[str, Any]]) -> Generator[dict[str, Any], None, None]:
+        if not self.prefetch_episodes:
+            yield from episodes
+            return
+
+        executor = ThreadPoolExecutor(max_workers=1)
+        try:
+            pending = deque(executor.submit(next, episodes, None) for _ in range(self.prefetch_episodes))
+            while pending:
+                episode = pending.popleft().result()
+                if episode is None:
+                    break
+                pending.append(executor.submit(next, episodes, None))
+                yield episode
+        finally:
+            executor.shutdown(cancel_futures=True)
 
     def _uses_default_video_query(self) -> bool:
         return (
@@ -291,7 +444,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         pending: deque[Future[dict[str, Any]]] = deque()
         for item in samples:
             pending.append(executor.submit(query_frames, item))
-            if len(pending) == _DECODE_WORKERS:
+            if len(pending) == self.decoded_queue_size:
                 yield pending.popleft().result()
         while pending:
             yield pending.popleft().result()
@@ -346,9 +499,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         executor: ThreadPoolExecutor,
         decoder_pool: _StreamingVideoDecoderPool,
     ) -> Iterator[dict[str, Any]]:
-        groups = batched(samples, _RGB_DECODE_GROUP_SIZE)
-        # Use the same prefetch limit in samples as the per-sample decoder.
-        max_pending_groups = _DECODE_WORKERS // _RGB_DECODE_GROUP_SIZE
+        group_size = min(_RGB_DECODE_GROUP_SIZE, self.decoded_queue_size)
+        groups = batched(samples, group_size)
+        # Count samples, including groups that have ready results, against the same queue limit.
+        max_pending_groups = self.decoded_queue_size // group_size
         pending = deque(
             self._submit_rgb_group(group, executor, decoder_pool)
             for group in islice(groups, max_pending_groups)
@@ -510,12 +664,14 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         read_rgb_video: Callable[[str, list[float]], torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         item = {}
+        worker = torch.utils.data.get_worker_info()
+        cache_bytes = self._video_cache_bytes_for_worker(worker.num_workers if worker is not None else 1)
         for video_key, query_ts in query_timestamps.items():
             video_path = self._video_path(ep_idx, video_key)
             if video_key in self.meta.depth_keys:
                 # Depth maps are 12-bit quantized and only decodable via pyav; dequantize back
                 # to physical units to match the non-streaming reader.
-                with fsspec.open(video_path) as video_file:
+                with _open_streaming_video(video_path, cache_bytes) as video_file:
                     frames = decode_video_frames(
                         video_file,
                         query_ts,
@@ -536,7 +692,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             elif read_rgb_video is not None:
                 frames = read_rgb_video(video_path, query_ts)
             else:
-                with fsspec.open(video_path) as video_file:
+                with _open_streaming_video(video_path, cache_bytes) as video_file:
                     frames = decode_video_frames_torchcodec(
                         video_file,
                         query_ts,

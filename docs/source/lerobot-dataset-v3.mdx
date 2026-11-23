@@ -159,6 +159,34 @@ lerobot-train \
   ...
 ```
 
+### Set the streaming limits
+
+Each worker reads Parquet rows and mixes samples from a pool of complete episodes. A worker with
+fewer eligible episodes uses only the episodes it has. With `--num_workers=0`, the training process
+acts as one streaming worker.
+
+| Training flag | Unit and scope | Default |
+| --- | --- | --- |
+| `--dataset.streaming_episode_pool_size` | Complete episodes in the mixing pool of each worker | 32 divided by the worker count, rounded to the nearest integer with a minimum of one |
+| `--dataset.streaming_prefetch_episodes` | Complete Parquet episodes to read ahead per worker | 8. Set 0 to read in the training or DataLoader thread. |
+| `--dataset.streaming_video_cache_bytes` | Remote video file bytes retained per worker process and cache configuration | The Datasets cache default. Set 0 to disable retention. |
+| `--prefetch_factor` | Batches PyTorch requests in advance per DataLoader worker | 4 when `--num_workers` is greater than 0 |
+
+For example, `--dataset.streaming_episode_pool_size=128 --num_workers=4` lets four active
+workers mix up to 512 episodes on each rank. Episode read-ahead holds additional Parquet rows.
+Video decoding starts when a sample is requested. The training log reports each worker's limits and the potential rank totals.
+
+Within a process, matching Datasets cache configurations share the cached video bytes across files
+and threads. Each worker process can fill its own cache. The cache cap covers retained file bytes.
+Episode rows, decoded tensors, pending reads, decoder state and PyTorch queues use additional
+memory. Local video reads bypass the remote cache.
+
+A previously set `streaming_episode_pool_size` keeps its per-worker meaning. A training config with
+the legacy `streaming_byte_budget_gb` divides that rank's GiB budget across the worker processes
+and applies each share to the remote video cache. Use `streaming_video_cache_bytes` for new runs.
+The new reader uses `streaming_prefetch_episodes` to fetch Parquet rows. Old custom settings for
+sampling strategy, native HTTP and sidecar locks require removal before you load the training config.
+
 <div style="display:flex; justify-content:center; gap:12px; flex-wrap:wrap;">
   <figure style="margin:0; text-align:center;">
     <img

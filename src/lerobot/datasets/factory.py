@@ -30,7 +30,7 @@ from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .storage import DEFAULT_STORAGE_FORMAT, load_dataset_metadata
-from .streaming_dataset import StreamingLeRobotDataset
+from .streaming_dataset import DEFAULT_STREAMING_SEED, StreamingLeRobotDataset
 from .utils import resolve_episode_indices
 
 logger = logging.getLogger(__name__)
@@ -165,6 +165,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
                 depth_output_unit=cfg.dataset.depth_output_unit,
                 tolerance_s=cfg.tolerance_s,
                 repo_type=repo_type,
+                video_decoder_cache_size=cfg.dataset.video_decoder_cache_size,
             )
         else:
             dataset = StreamingLeRobotDataset(
@@ -174,10 +175,18 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | StreamingLeRobotD
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=cfg.dataset.revision,
-                max_num_shards=cfg.num_workers,
+                seed=cfg.seed if cfg.seed is not None else DEFAULT_STREAMING_SEED,
                 tolerance_s=cfg.tolerance_s,
                 return_uint8=True,
+                depth_output_unit=cfg.dataset.depth_output_unit,
                 repo_type=repo_type,
+                episode_pool_size=cfg.dataset.streaming_episode_pool_size,
+                prefetch_episodes=cfg.dataset.streaming_prefetch_episodes,
+                video_cache_bytes=cfg.dataset.streaming_video_cache_bytes,
+                byte_budget_gb=cfg.dataset.streaming_byte_budget_gb,
+                decode_threads=cfg.dataset.streaming_decode_threads,
+                decoded_queue_size=cfg.dataset.streaming_decoded_queue_size,
+                video_decoder_cache_size=cfg.dataset.video_decoder_cache_size,
             )
     else:
         raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")

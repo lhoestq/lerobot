@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 from lerobot.transforms import ImageTransformsConfig
@@ -58,12 +59,57 @@ class DatasetConfig:
     # Storage connection options (string keys and values) for Lance dataset backends.
     # Configs are logged and saved; credential-like entries are removed in __post_init__.
     storage_options: dict[str, str] | None = None
+    # Episodes to mix in each streaming worker. None divides a target of 32 across workers.
+    streaming_episode_pool_size: int | None = None
+    # Complete Parquet episodes to read ahead per streaming worker. Set 0 for synchronous reads.
+    streaming_prefetch_episodes: int = 8
+    # Cached remote video bytes per worker process. None uses Datasets' default. Set 0 to disable retention.
+    streaming_video_cache_bytes: int | None = None
+    # Decode threads and queued sample requests per streaming worker.
+    streaming_decode_threads: int = 32
+    streaming_decoded_queue_size: int = 32
+    # Legacy per-rank budget in GiB. Use streaming_video_cache_bytes for new runs.
+    streaming_byte_budget_gb: float | None = None
+    # Maximum open decoders for the rank in streaming mode, or per worker for Lance.
+    video_decoder_cache_size: int | None = None
+    # Accept legacy checkpoints that used defaults for the removed reader.
+    streaming_sampling_strategy: str | None = None
+    streaming_native_http_connections: int | None = None
+    streaming_native_http_subranges: int | None = None
+    streaming_sidecar_lock_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
         if self.repo_type not in ("dataset", "bucket"):
             raise ValueError(f"repo_type must be 'dataset' or 'bucket', got {self.repo_type!r}")
         if self.streaming and self.storage_options is not None:
             raise ValueError("dataset.storage_options is not supported with dataset.streaming=true.")
+        if self.streaming_episode_pool_size is not None and self.streaming_episode_pool_size <= 0:
+            raise ValueError("streaming_episode_pool_size must be positive.")
+        if self.streaming_prefetch_episodes < 0:
+            raise ValueError("streaming_prefetch_episodes must be non-negative.")
+        if self.streaming_video_cache_bytes is not None and self.streaming_video_cache_bytes < 0:
+            raise ValueError("streaming_video_cache_bytes must be non-negative.")
+        if self.streaming_byte_budget_gb is not None:
+            if not math.isfinite(self.streaming_byte_budget_gb) or self.streaming_byte_budget_gb <= 0:
+                raise ValueError("streaming_byte_budget_gb must be finite and positive.")
+            if self.streaming_video_cache_bytes is not None:
+                raise ValueError("Set streaming_video_cache_bytes or streaming_byte_budget_gb.")
+        if self.streaming_decode_threads <= 0:
+            raise ValueError("streaming_decode_threads must be positive.")
+        if self.streaming_decoded_queue_size <= 0:
+            raise ValueError("streaming_decoded_queue_size must be positive.")
+        if self.video_decoder_cache_size is not None and self.video_decoder_cache_size <= 0:
+            raise ValueError("video_decoder_cache_size must be positive.")
+        if self.streaming:
+            removed_options = {
+                "streaming_sampling_strategy": (self.streaming_sampling_strategy, "remaining"),
+                "streaming_native_http_connections": (self.streaming_native_http_connections, None),
+                "streaming_native_http_subranges": (self.streaming_native_http_subranges, 1),
+                "streaming_sidecar_lock_timeout_s": (self.streaming_sidecar_lock_timeout_s, 30 * 60),
+            }
+            for name, (value, old_default) in removed_options.items():
+                if value is not None and value != old_default:
+                    raise ValueError(f"{name} is no longer supported. Remove it to use the Datasets reader.")
         if self.storage_options and any(key.lower() == "revision" for key in self.storage_options):
             raise ValueError(
                 "dataset.storage_options must not contain 'revision'; use dataset.revision instead."

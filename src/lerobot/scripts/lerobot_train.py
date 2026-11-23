@@ -676,6 +676,8 @@ def train(cfg: TrainPipelineConfig) -> None:
         step = resume_before_prepare(cfg)  # step + RNG only; sharded state loads after prepare
 
     dataloader, eval_dataloader = make_dataloaders(cfg, dataset, eval_dataset, step, parallel_dims)
+    if is_main_process() and isinstance(dataset, StreamingLeRobotDataset):
+        dataset.log_worker_limits(dataloader.num_workers, dataloader.prefetch_factor)
 
     # --- prepare & resume phase 2 ---------------------------------------------------------------
     # The FSDP wrap-unit class names resolve right before prepare: user override, else the

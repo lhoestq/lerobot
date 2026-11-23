@@ -267,6 +267,12 @@ class _StreamingVideoDecoderEntry:
     decoder: "VideoDecoder"
 
 
+def _open_streaming_video(path: str, cache_bytes: int | None = None) -> fsspec.core.OpenFile:
+    if cache_bytes is None or not path.startswith("sharedblockcache::"):
+        return fsspec.open(path)
+    return fsspec.open(path, sharedblockcache={"max_memory": cache_bytes})
+
+
 class _StreamingVideoDecoderPool:
     """Keep a bounded set of open decoders for one streaming iterator.
 
@@ -274,10 +280,11 @@ class _StreamingVideoDecoderPool:
     one path can use separate decoders, and eviction only closes idle entries.
     """
 
-    def __init__(self, capacity: int):
+    def __init__(self, capacity: int, *, cache_bytes: int | None = None):
         if capacity < 1:
             raise ValueError("The video decoder pool requires a positive capacity")
         self._capacity = capacity
+        self._cache_bytes = cache_bytes
         self._condition = threading.Condition()
         self._size = 0
         self._idle: list[_StreamingVideoDecoderEntry] = []
@@ -301,7 +308,7 @@ class _StreamingVideoDecoderPool:
         try:
             if evicted_resources is not None:
                 evicted_resources.close()
-            video_file = resources.enter_context(fsspec.open(path))
+            video_file = resources.enter_context(_open_streaming_video(path, self._cache_bytes))
             decoder = VideoDecoder(video_file, seek_mode="approximate")
         except BaseException:
             self._discard(resources)
